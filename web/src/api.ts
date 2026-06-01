@@ -17,16 +17,32 @@ export interface Job {
   error: string | null
 }
 
-export async function submitImages(files: File[]): Promise<{ job_id: string; status: string }> {
-  const body = new FormData()
-  for (const f of files) body.append('images', f)
+export function submitImages(
+  files: File[],
+  onProgress?: (pct: number) => void,
+): Promise<{ job_id: string; status: string }> {
+  return new Promise((resolve, reject) => {
+    const body = new FormData()
+    for (const f of files) body.append('images', f)
 
-  const res = await fetch(`${BASE}/api/reconstructions`, { method: 'POST', body })
-  if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`Upload failed (${res.status}): ${text}`)
-  }
-  return res.json()
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${BASE}/api/reconstructions`)
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress?.(Math.round((e.loaded / e.total) * 100))
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(JSON.parse(xhr.responseText))
+      } else {
+        reject(new Error(`Upload failed (${xhr.status}): ${xhr.responseText}`))
+      }
+    }
+
+    xhr.onerror = () => reject(new Error('Network error during upload'))
+    xhr.send(body)
+  })
 }
 
 export async function fetchJob(jobId: string): Promise<Job> {

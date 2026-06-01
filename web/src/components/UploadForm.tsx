@@ -6,9 +6,10 @@ const ALLOWED_MIME = new Set(['image/jpeg', 'image/png', 'image/webp'])
 interface Props {
   onSubmit: (files: File[]) => void
   disabled: boolean
+  uploadProgress: number | null  // 0-100 while uploading, null otherwise
 }
 
-export function UploadForm({ onSubmit, disabled }: Props) {
+export function UploadForm({ onSubmit, disabled, uploadProgress }: Props) {
   const [files, setFiles] = useState<File[]>([])
   const [error, setError] = useState<string | null>(null)
   const [dragging, setDragging] = useState(false)
@@ -115,8 +116,32 @@ export function UploadForm({ onSubmit, disabled }: Props) {
           opacity: files.length === 0 || disabled ? 0.5 : 1,
         }}
       >
-        Reconstruct
+        {uploadProgress !== null ? `Uploading… ${uploadProgress}%` : 'Reconstruct'}
       </button>
+
+      {uploadProgress !== null && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{
+            height: 4,
+            background: '#e2e8f0',
+            borderRadius: 2,
+            overflow: 'hidden',
+          }}>
+            <div style={{
+              height: '100%',
+              width: `${uploadProgress}%`,
+              background: '#2563eb',
+              borderRadius: 2,
+              transition: 'width 0.1s ease',
+            }} />
+          </div>
+          <p style={{ margin: '4px 0 0', fontSize: 12, color: '#64748b' }}>
+            {uploadProgress < 100
+              ? `Uploading ${files.length} image${files.length !== 1 ? 's' : ''}…`
+              : 'Processing…'}
+          </p>
+        </div>
+      )}
     </div>
   )
 }

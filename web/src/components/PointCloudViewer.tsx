@@ -1,6 +1,7 @@
 import { Suspense, useEffect, useRef } from 'react'
 import { Canvas, useLoader, useThree } from '@react-three/fiber'
-import { TrackballControls, Html } from '@react-three/drei'
+import { GizmoHelper, GizmoViewport, Html } from '@react-three/drei'
+import { TrackballControls } from '@react-three/drei'
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js'
 import * as THREE from 'three'
 import type { JobResult } from '../api'
@@ -11,15 +12,24 @@ interface Props {
 }
 
 export function PointCloudViewer({ result, onReset }: Props) {
+  // Shared ref so the reset button (outside Canvas) can call controls.reset()
+  const controlsRef = useRef<any>(null)
+
   return (
     <div style={{ width: '100vw', height: '100vh', background: '#0f172a', position: 'relative' }}>
       <Canvas camera={{ fov: 60, near: 0.01, far: 1000 }}>
         <Suspense fallback={<LoadingOverlay />}>
-          <PointCloud url={result.ply_url} />
-          <TrackballControls rotateSpeed={3} zoomSpeed={1.2} panSpeed={0.8} />
+          <SceneContent url={result.ply_url} controlsRef={controlsRef} />
+          <GizmoHelper alignment="bottom-right" margin={[72, 72]}>
+            <GizmoViewport
+              axisColors={['#f87171', '#4ade80', '#60a5fa']}
+              labelColor="white"
+            />
+          </GizmoHelper>
         </Suspense>
       </Canvas>
 
+      {/* Info overlay */}
       <div style={{
         position: 'absolute',
         top: 16,
@@ -38,28 +48,49 @@ export function PointCloudViewer({ result, onReset }: Props) {
         </div>
       </div>
 
-      <button
-        onClick={onReset}
-        style={{
-          position: 'absolute',
-          top: 16,
-          right: 16,
-          padding: '8px 16px',
-          background: '#1e293b',
-          color: '#cbd5e1',
-          border: '1px solid #334155',
-          borderRadius: 6,
-          fontSize: 13,
-          cursor: 'pointer',
-        }}
-      >
-        Start over
-      </button>
+      {/* Controls */}
+      <div style={{
+        position: 'absolute',
+        top: 16,
+        right: 16,
+        display: 'flex',
+        gap: 8,
+        fontFamily: 'system-ui, sans-serif',
+      }}>
+        <button
+          onClick={() => controlsRef.current?.reset()}
+          style={buttonStyle}
+        >
+          Reset view
+        </button>
+        <button onClick={onReset} style={buttonStyle}>
+          Start over
+        </button>
+      </div>
     </div>
   )
 }
 
-function PointCloud({ url }: { url: string }) {
+const buttonStyle: React.CSSProperties = {
+  padding: '8px 14px',
+  background: '#1e293b',
+  color: '#cbd5e1',
+  border: '1px solid #334155',
+  borderRadius: 6,
+  fontSize: 13,
+  cursor: 'pointer',
+}
+
+// ----------------------------------------------------------------------------
+// Scene — lives inside Canvas so it can access useThree + useLoader
+// ----------------------------------------------------------------------------
+
+interface SceneContentProps {
+  url: string
+  controlsRef: React.RefObject<any>
+}
+
+function SceneContent({ url, controlsRef }: SceneContentProps) {
   const geometry = useLoader(PLYLoader, url)
   const { camera } = useThree()
 
@@ -77,19 +108,30 @@ function PointCloud({ url }: { url: string }) {
     camera.near = r * 0.001
     camera.far = r * 20
     camera.updateProjectionMatrix()
-  }, [geometry, camera])
+
+    // Save this as the "home" state so reset() returns here
+    setTimeout(() => controlsRef.current?.saveState(), 0)
+  }, [geometry, camera, controlsRef])
 
   const hasColors = !!geometry.attributes.color
 
   return (
-    <points geometry={geometry}>
-      <pointsMaterial
-        vertexColors={hasColors}
-        color={hasColors ? undefined : '#7dd3fc'}
-        size={0.005}
-        sizeAttenuation
+    <>
+      <points geometry={geometry}>
+        <pointsMaterial
+          vertexColors={hasColors}
+          color={hasColors ? undefined : '#7dd3fc'}
+          size={0.005}
+          sizeAttenuation
+        />
+      </points>
+      <TrackballControls
+        ref={controlsRef}
+        rotateSpeed={3}
+        zoomSpeed={1.2}
+        panSpeed={0.8}
       />
-    </points>
+    </>
   )
 }
 

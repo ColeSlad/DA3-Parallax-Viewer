@@ -14,6 +14,7 @@ function Inner() {
   const [phase, setPhase] = useState<Phase>('idle')
   const [jobId, setJobId] = useState<string | null>(null)
   const [submitError, setSubmitError] = useState<string | null>(null)
+  const [uploadProgress, setUploadProgress] = useState<number>(0)
 
   const { data: job } = useJob(phase === 'polling' || phase === 'done' || phase === 'error' ? jobId : null)
 
@@ -27,8 +28,9 @@ function Inner() {
   async function handleSubmit(files: File[]) {
     setPhase('submitting')
     setSubmitError(null)
+    setUploadProgress(0)
     try {
-      const { job_id } = await submitImages(files)
+      const { job_id } = await submitImages(files, setUploadProgress)
       setJobId(job_id)
       setPhase('polling')
     } catch (e) {
@@ -61,7 +63,7 @@ function Inner() {
 
   return (
     <>
-      <UploadForm onSubmit={handleSubmit} disabled={phase === 'submitting'} />
+      <UploadForm onSubmit={handleSubmit} disabled={phase === 'submitting'} uploadProgress={phase === 'submitting' ? uploadProgress : null} />
       {submitError && (
         <p style={{
           maxWidth: 560,
