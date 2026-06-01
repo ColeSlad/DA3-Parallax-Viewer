@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env zsh
 # End-to-end API smoke test.
 #
 # Usage:
@@ -23,8 +23,8 @@ if ! command -v jq &>/dev/null; then
   exit 1
 fi
 
-# Collect image files
-mapfile -t IMAGE_FILES < <(find "$IMAGE_DIR" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" \) | sort)
+# Collect image files (zsh glob, case-insensitive)
+IMAGE_FILES=(${(f)"$(find "$IMAGE_DIR" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" \) | sort)"})
 
 if [[ ${#IMAGE_FILES[@]} -eq 0 ]]; then
   echo "No images found in $IMAGE_DIR" >&2
@@ -36,7 +36,7 @@ echo "=== Uploading ${#IMAGE_FILES[@]} images to $API_URL ==="
 # Build -F args
 FORM_ARGS=()
 for f in "${IMAGE_FILES[@]}"; do
-  FORM_ARGS+=(-F "images[]=@${f}")
+  FORM_ARGS+=(-F "images=@${f}")
 done
 
 response=$(curl -sf -X POST "$API_URL/api/reconstructions" "${FORM_ARGS[@]}")

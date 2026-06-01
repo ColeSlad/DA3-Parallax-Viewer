@@ -61,6 +61,10 @@ da3_image = (
         "open3d",
         "Pillow",
         "huggingface_hub",
+        # DB + R2 deps for the API worker (installed here so worker_image can
+        # extend da3_image with only add_local_python_source at the end)
+        "psycopg2-binary",
+        "boto3",
     )
     .add_local_python_source("inference")
 )

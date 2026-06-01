@@ -124,9 +124,9 @@ GET  /api/reconstructions/{job_id}
 ```bash
 # 1. Upload images and capture job_id
 JOB=$(curl -sf -X POST https://<your-url>/api/reconstructions \
-  -F "images[]=@images/001.jpg" \
-  -F "images[]=@images/002.jpg" \
-  -F "images[]=@images/003.jpg")
+  -F "images=@images/001.jpg" \
+  -F "images=@images/002.jpg" \
+  -F "images=@images/003.jpg")
 echo $JOB
 JOB_ID=$(echo $JOB | jq -r '.job_id')
 

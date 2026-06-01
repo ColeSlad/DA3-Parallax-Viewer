@@ -23,13 +23,9 @@ from inference.app import app, da3_image, weights_volume, WEIGHTS_DIR
 
 secrets = [modal.Secret.from_name("da3-parallax-secrets")]
 
-# GPU worker image: extends da3_image (which already has torch, DA3, open3d,
-# and the inference package) with DB and R2 deps + the api package.
-worker_image = (
-    da3_image
-    .pip_install("psycopg2-binary", "boto3")
-    .add_local_python_source("api")
-)
+# GPU worker image: da3_image already has all inference + DB + R2 deps;
+# just add the api package last (add_local_* must come after all build steps).
+worker_image = da3_image.add_local_python_source("api")
 
 # API image: lightweight, no GPU deps.
 api_image = (
