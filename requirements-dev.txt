@@ -1,0 +1,6 @@
+# Local dev dependencies (for running modal CLI and local tooling)
+# DA3 itself + torch run on the Modal container, not locally.
+modal
+numpy
+open3d
+Pillow
