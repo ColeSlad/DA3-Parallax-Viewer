@@ -231,6 +231,92 @@ def reconstruct_from_soh(
 
 
 # ---------------------------------------------------------------------------
+# General-purpose function: accepts raw image bytes from the local machine
+# ---------------------------------------------------------------------------
+
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+@app.function(
+    image=da3_image,
+    gpu="L4",
+    volumes={WEIGHTS_DIR: weights_volume},
+    timeout=600,
+)
+def reconstruct_from_bytes(
+    image_data: list[tuple[str, bytes]],  # [(filename, bytes), ...]
+    conf_percentile: float = 25.0,
+    voxel_size: float = 0.02,
+) -> tuple[bytes, dict]:
+    """
+    Accept image bytes from the local machine, write them to a temp dir in
+    the container, and run reconstruction.  Returns (ply_bytes, metrics_dict).
+    """
+    import tempfile
+    import time
+
+    import numpy as np
+    from depth_anything_3.api import DepthAnything3
+
+    from inference.reconstruction import build_point_cloud, ply_to_bytes
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        image_paths = []
+        for name, data in image_data:
+            p = Path(tmpdir) / name
+            p.write_bytes(data)
+            image_paths.append(str(p))
+        image_paths.sort()
+
+        print(f"[DA3] Received {len(image_paths)} images: {[Path(p).name for p in image_paths]}")
+
+        t0 = time.perf_counter()
+        model = DepthAnything3.from_pretrained(
+            "depth-anything/DA3-LARGE-1.1",
+            cache_dir=WEIGHTS_DIR,
+        )
+        model = model.to(device="cuda")
+        print(f"[DA3] Model loaded in {time.perf_counter() - t0:.1f}s")
+
+        t1 = time.perf_counter()
+        pred = model.inference(image_paths)
+        infer_s = time.perf_counter() - t1
+        print(f"[DA3] Inference done in {infer_s:.1f}s")
+
+        depths = np.asarray(pred.depth)
+        confs = np.asarray(pred.conf)
+        intrinsics = np.asarray(pred.intrinsics)
+        extrinsics = np.asarray(pred.extrinsics)
+        images_np = np.asarray(pred.processed_images, dtype=np.uint8)
+
+        t2 = time.perf_counter()
+        result = build_point_cloud(
+            depths=depths,
+            confs=confs,
+            intrinsics=intrinsics,
+            extrinsics=extrinsics,
+            processed_images=images_np,
+            conf_percentile=conf_percentile,
+            voxel_size=voxel_size,
+        )
+        recon_s = time.perf_counter() - t2
+        total_s = time.perf_counter() - t0
+
+    metrics = {
+        "view_count": len(image_paths),
+        "raw_count": result.raw_count,
+        "filtered_count": result.filtered_count,
+        "voxel_count": result.voxel_count,
+        "conf_threshold": result.conf_threshold,
+        "infer_s": round(infer_s, 2),
+        "recon_s": round(recon_s, 2),
+        "total_s": round(total_s, 2),
+    }
+
+    return ply_to_bytes(result), metrics
+
+
+# ---------------------------------------------------------------------------
 # Local entrypoint
 # ---------------------------------------------------------------------------
 
@@ -240,25 +326,50 @@ def validate(
     conf_percentile: float = 25.0,
     voxel_size: float = 0.02,
     output: str = "output/validation.ply",
+    image_dir: str = "",
 ):
     """
-    Drive reconstruction against the SOH example scene and write a .ply locally.
+    Drive reconstruction and write a .ply locally.
 
     Usage:
+        # Use the bundled DA3 SOH example images
         modal run inference/app.py::validate
-        modal run inference/app.py::validate --conf-percentile 40 --voxel-size 0.01
+
+        # Use your own photos
+        modal run inference/app.py::validate --image-dir /path/to/photos
+
+        # Tune quality
+        modal run inference/app.py::validate --image-dir ./photos --conf-percentile 40 --voxel-size 0.01
     """
     print(
         f"\n=== DA3-Parallax validation ===\n"
         f"  conf_percentile : {conf_percentile}\n"
         f"  voxel_size      : {voxel_size}\n"
+        f"  image_dir       : {image_dir or '(SOH example scene)'}\n"
     )
 
     t0 = time.perf_counter()
-    ply_bytes, metrics = reconstruct_from_soh.remote(
-        conf_percentile=conf_percentile,
-        voxel_size=voxel_size,
-    )
+
+    if image_dir:
+        src = Path(image_dir)
+        if not src.is_dir():
+            raise SystemExit(f"--image-dir {image_dir!r} is not a directory")
+        files = sorted(p for p in src.iterdir() if p.suffix.lower() in _IMAGE_EXTS)
+        if not files:
+            raise SystemExit(f"No images ({', '.join(_IMAGE_EXTS)}) found in {image_dir}")
+        print(f"  Loading {len(files)} images from {src.resolve()} ...")
+        image_data = [(p.name, p.read_bytes()) for p in files]
+        ply_bytes, metrics = reconstruct_from_bytes.remote(
+            image_data=image_data,
+            conf_percentile=conf_percentile,
+            voxel_size=voxel_size,
+        )
+    else:
+        ply_bytes, metrics = reconstruct_from_soh.remote(
+            conf_percentile=conf_percentile,
+            voxel_size=voxel_size,
+        )
+
     wall_s = time.perf_counter() - t0
 
     out_path = Path(output)
