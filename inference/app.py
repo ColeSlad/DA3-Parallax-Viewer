@@ -11,7 +11,6 @@ that pulls the SOH example images, calls it, and writes output/validation.ply.
 
 from __future__ import annotations
 
-import sys
 import time
 from pathlib import Path
 
@@ -41,6 +40,9 @@ WEIGHTS_DIR = "/weights"
 
 da3_image = (
     modal.Image.debian_slim(python_version="3.11")
+    # git for cloning DA3; libgl1 + libglib2.0-0 satisfy opencv's runtime
+    # shared-library deps on a headless Debian image
+    .apt_install("git", "libgl1", "libglib2.0-0")
     .pip_install(
         "torch>=2",
         "torchvision",
@@ -50,6 +52,9 @@ da3_image = (
     .run_commands(
         "git clone https://github.com/ByteDance-Seed/Depth-Anything-3 /opt/da3",
         "pip install -e /opt/da3",
+        # DA3 pulls opencv-python which links against libGL; swap it for the
+        # headless wheel so no display server is needed at runtime
+        "pip install opencv-python-headless --upgrade",
     )
     .pip_install(
         "numpy",
@@ -57,6 +62,7 @@ da3_image = (
         "Pillow",
         "huggingface_hub",
     )
+    .add_local_python_source("inference")
 )
 
 # ---------------------------------------------------------------------------
@@ -93,13 +99,7 @@ def reconstruct(
     """
     import torch
     from depth_anything_3.api import DepthAnything3
-
-    # sys.path needs /opt/da3 so internal DA3 imports resolve (installed as editable)
-    if "/opt/da3" not in sys.path:
-        sys.path.insert(0, "/opt/da3")
-
-    # Import here (after image is active) to avoid import-time GPU requirement
-    from inference.reconstruction import ReconstructionResult, build_point_cloud, ply_to_bytes  # noqa: E501
+    from inference.reconstruction import ReconstructionResult, build_point_cloud, ply_to_bytes
 
     t0 = time.perf_counter()
     print(f"[DA3] Loading model from {WEIGHTS_DIR} ...")
@@ -167,11 +167,7 @@ def reconstruct_from_soh(
     reconstruction.  Returns (ply_bytes, metrics_dict).
     """
     import glob
-    import sys
     import time
-
-    if "/opt/da3" not in sys.path:
-        sys.path.insert(0, "/opt/da3")
 
     from inference.reconstruction import build_point_cloud, ply_to_bytes
 
