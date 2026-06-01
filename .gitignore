@@ -33,3 +33,8 @@ Thumbs.db
 ~/.cache/huggingface/
 
 images/
+
+# Frontend
+web/node_modules/
+web/dist/
+web/.env.local
