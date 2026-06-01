@@ -117,16 +117,11 @@ def reconstruct(
 
     import numpy as np
 
-    depths = pred.depth.cpu().numpy()           # (N, H, W)
-    confs = pred.conf.cpu().numpy()             # (N, H, W)
-    intrinsics = pred.intrinsics.cpu().numpy()  # (N, 3, 3)
-    extrinsics = pred.extrinsics.cpu().numpy()  # (N, 3, 4)
-    images_np = pred.processed_images           # (N, H, W, 3) uint8
-
-    # processed_images may be a tensor or numpy array depending on DA3 version
-    if hasattr(images_np, "cpu"):
-        images_np = images_np.cpu().numpy()
-    images_np = np.asarray(images_np, dtype=np.uint8)
+    depths = np.asarray(pred.depth)
+    confs = np.asarray(pred.conf)
+    intrinsics = np.asarray(pred.intrinsics)
+    extrinsics = np.asarray(pred.extrinsics)
+    images_np = np.asarray(pred.processed_images, dtype=np.uint8)
 
     t2 = time.perf_counter()
     result = build_point_cloud(
@@ -201,14 +196,12 @@ def reconstruct_from_soh(
     infer_s = time.perf_counter() - t1
     print(f"[DA3] Inference done in {infer_s:.1f}s")
 
-    depths = pred.depth.cpu().numpy()
-    confs = pred.conf.cpu().numpy()
-    intrinsics = pred.intrinsics.cpu().numpy()
-    extrinsics = pred.extrinsics.cpu().numpy()
-    images_np = pred.processed_images
-    if hasattr(images_np, "cpu"):
-        images_np = images_np.cpu().numpy()
-    images_np = np.asarray(images_np, dtype=np.uint8)
+    # pred fields may be numpy arrays or torch tensors depending on DA3 version
+    depths = np.asarray(pred.depth)
+    confs = np.asarray(pred.conf)
+    intrinsics = np.asarray(pred.intrinsics)
+    extrinsics = np.asarray(pred.extrinsics)
+    images_np = np.asarray(pred.processed_images, dtype=np.uint8)
 
     t2 = time.perf_counter()
     result = build_point_cloud(
