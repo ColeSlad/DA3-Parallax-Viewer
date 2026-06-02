@@ -1,4 +1,4 @@
-import { Suspense, useEffect, useRef } from 'react'
+import { Suspense, useEffect, useRef, useState } from 'react'
 import { Canvas, useLoader, useThree } from '@react-three/fiber'
 import { GizmoHelper, GizmoViewport, Html } from '@react-three/drei'
 import { TrackballControls } from '@react-three/drei'
@@ -12,12 +12,15 @@ interface Props {
 }
 
 export function PointCloudViewer({ result, onReset }: Props) {
-  // Shared ref so the reset button (outside Canvas) can call controls.reset()
   const controlsRef = useRef<any>(null)
 
   return (
     <div style={{ width: '100vw', height: '100vh', background: '#0f172a', position: 'relative' }}>
-      <Canvas camera={{ fov: 60, near: 0.01, far: 1000 }}>
+      {/*
+        Set up=[1,0,0] here so the camera is created with X as up BEFORE
+        TrackballControls or the geometry useEffect runs.
+      */}
+      <Canvas camera={{ fov: 60, near: 0.01, far: 1000, up: [-1, 0, 0], position: [0, 0, 5] }}>
         <Suspense fallback={<LoadingOverlay />}>
           <SceneContent url={result.ply_url} controlsRef={controlsRef} />
           <GizmoHelper alignment="bottom-right" margin={[72, 72]}>
@@ -29,7 +32,6 @@ export function PointCloudViewer({ result, onReset }: Props) {
         </Suspense>
       </Canvas>
 
-      {/* Info overlay */}
       <div style={{
         position: 'absolute',
         top: 16,
@@ -48,7 +50,6 @@ export function PointCloudViewer({ result, onReset }: Props) {
         </div>
       </div>
 
-      {/* Controls */}
       <div style={{
         position: 'absolute',
         top: 16,
@@ -57,10 +58,7 @@ export function PointCloudViewer({ result, onReset }: Props) {
         gap: 8,
         fontFamily: 'system-ui, sans-serif',
       }}>
-        <button
-          onClick={() => controlsRef.current?.reset()}
-          style={buttonStyle}
-        >
+        <button onClick={() => controlsRef.current?.reset()} style={buttonStyle}>
           Reset view
         </button>
         <button onClick={onReset} style={buttonStyle}>
@@ -81,10 +79,6 @@ const buttonStyle: React.CSSProperties = {
   cursor: 'pointer',
 }
 
-// ----------------------------------------------------------------------------
-// Scene — lives inside Canvas so it can access useThree + useLoader
-// ----------------------------------------------------------------------------
-
 interface SceneContentProps {
   url: string
   controlsRef: React.RefObject<any>
@@ -93,23 +87,25 @@ interface SceneContentProps {
 function SceneContent({ url, controlsRef }: SceneContentProps) {
   const geometry = useLoader(PLYLoader, url)
   const { camera } = useThree()
+  // Offset to center the cloud without mutating the cached geometry
+  const [offset, setOffset] = useState<[number, number, number]>([0, 0, 0])
 
   useEffect(() => {
-    if (!geometry) return
-
     geometry.computeBoundingSphere()
     const sphere = geometry.boundingSphere!
+    const c = sphere.center
 
-    geometry.translate(-sphere.center.x, -sphere.center.y, -sphere.center.z)
-    geometry.computeBoundingSphere()
+    // Center via mesh position, not geometry mutation — safe for useLoader cache
+    setOffset([-c.x, -c.y, -c.z])
 
-    const r = geometry.boundingSphere!.radius
-    camera.position.set(0, r * 0.5, r * 2.5)
+    const r = sphere.radius
+    // Camera already has up=(-1,0,0) from Canvas prop; just set distance
+    camera.position.set(0, 0, r * 2.5)
+    camera.lookAt(0, 0, 0)
     camera.near = r * 0.001
     camera.far = r * 20
     camera.updateProjectionMatrix()
 
-    // Save this as the "home" state so reset() returns here
     setTimeout(() => controlsRef.current?.saveState(), 0)
   }, [geometry, camera, controlsRef])
 
@@ -117,7 +113,7 @@ function SceneContent({ url, controlsRef }: SceneContentProps) {
 
   return (
     <>
-      <points geometry={geometry}>
+      <points geometry={geometry} position={offset} scale={[-1, 1, -1]}>
         <pointsMaterial
           vertexColors={hasColors}
           color={hasColors ? undefined : '#7dd3fc'}

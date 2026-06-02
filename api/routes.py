@@ -46,7 +46,7 @@ cors_origin = os.environ.get("CORS_ORIGIN", "http://localhost:5173")
 fastapi_app.add_middleware(
     CORSMiddleware,
     allow_origins=[cors_origin],
-    allow_methods=["GET", "POST"],
+    allow_methods=["*"],  # includes OPTIONS so XHR preflight is handled
     allow_headers=["*"],
 )
 
