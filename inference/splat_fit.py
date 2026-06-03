@@ -135,7 +135,7 @@ def fit_gaussians(
         optimizer.zero_grad()
 
         q = F.normalize(quats, dim=-1)
-        renders, alphas, _ = rasterization(
+        renders, _, _ = rasterization(
             means=means,
             quats=q,
             scales=torch.exp(log_scales),
@@ -146,12 +146,9 @@ def fit_gaussians(
             width=W,
             height=H,
             packed=False,
+            backgrounds=torch.ones(V, 3, device=device),
         )
-        # Composite over white background so transparent areas match training images
-        bg = torch.ones_like(renders)
-        renders_bg = renders + (1 - alphas.unsqueeze(-1)) * bg
-
-        loss = torch.abs(renders_bg - gt).mean()
+        loss = torch.abs(renders - gt).mean()
         loss.backward()
         optimizer.step()
 
@@ -250,14 +247,13 @@ def render_orbit(
         vm_t = torch.from_numpy(vm).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            renders, alphas, _ = rasterization(
+            renders, _, _ = rasterization(
                 means=means_t, quats=quats_t, scales=scales_t,
                 opacities=opacities_t, colors=colors_t,
                 viewmats=vm_t, Ks=K, width=W, height=H, packed=False,
+                backgrounds=torch.ones(1, 3, device=device),
             )
-        # White background composite
-        img = renders[0] + (1 - alphas[0].unsqueeze(-1))
-        frames.append((img.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8))
+        frames.append((renders[0].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8))
 
     return frames
 

@@ -70,16 +70,23 @@ da3_image = _da3_base.add_local_python_source("inference")
 # gsplat image: built on pytorch/pytorch devel so nvcc is available at image-build
 # time, which lets gsplat compile its CUDA extensions during pip install.
 # Can't inherit _da3_base (debian slim has no nvcc), so we reinstall DA3 deps here.
+# gsplat_image uses the NVIDIA CUDA devel image (has nvcc, pure pip — no conda).
+# The pytorch/pytorch images use conda; pip install -e /opt/da3 upgrades torch
+# inside conda and breaks torchvision's C++ ABI. Pure-pip avoids that entirely.
 gsplat_image = (
-    modal.Image.from_registry("pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel")
+    modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11")
     .apt_install("git", "libgl1", "libglib2.0-0")
-    # torch + torchvision are pre-installed and paired in the base image via conda.
-    # Do NOT pip-reinstall torchvision — it overwrites the conda-managed build and
-    # breaks the torchvision C++ extension ABI (causes "operator nms does not exist").
+    .pip_install(
+        "torch==2.4.0",
+        "torchvision==0.19.0",
+        extra_index_url=_TORCH_INDEX,
+    )
     .run_commands(
         "git clone https://github.com/ByteDance-Seed/Depth-Anything-3 /opt/da3",
         "pip install -e /opt/da3",
         "pip install opencv-python-headless --upgrade",
+        # DA3 has a loose torch>=2.0 dep; pip may have upgraded it. Re-pin.
+        f"pip install torch==2.4.0 torchvision==0.19.0 --extra-index-url {_TORCH_INDEX}",
     )
     .pip_install(
         "numpy",
@@ -90,7 +97,7 @@ gsplat_image = (
         "boto3",
         "imageio[pillow]",
     )
-    .pip_install("gsplat")  # nvcc is in PATH; CUDA extensions compile successfully
+    .pip_install("gsplat")  # nvcc is in PATH; CUDA extensions compile correctly
     .add_local_python_source("inference")
 )
 
