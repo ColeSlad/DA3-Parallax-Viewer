@@ -1,7 +1,6 @@
-import { Suspense, useEffect, useRef, useState } from 'react'
-import { Canvas, useLoader, useThree } from '@react-three/fiber'
-import { GizmoHelper, GizmoViewport, Html } from '@react-three/drei'
-import { TrackballControls } from '@react-three/drei'
+import { Suspense, useEffect, useRef, useState, type CSSProperties } from 'react'
+import { Canvas, useLoader, useThree, useFrame } from '@react-three/fiber'
+import { GizmoHelper, GizmoViewport, Html, TrackballControls } from '@react-three/drei'
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js'
 import * as THREE from 'three'
 import type { JobResult } from '../api'
@@ -12,18 +11,19 @@ interface Props {
 }
 
 export function PointCloudViewer({ result, onReset }: Props) {
-  const controlsRef = useRef<any>(null)
+  const savedCamera = useRef<{ pos: THREE.Vector3; quat: THREE.Quaternion; _apply?: boolean } | null>(null)
+  const [showControls, setShowControls] = useState(false)
+
+  function handleReset() {
+    if (savedCamera.current) savedCamera.current._apply = true
+  }
 
   return (
     <div style={{ width: '100vw', height: '100vh', background: '#0f172a', position: 'relative' }}>
-      {/*
-        Set up=[1,0,0] here so the camera is created with X as up BEFORE
-        TrackballControls or the geometry useEffect runs.
-      */}
       <Canvas camera={{ fov: 60, near: 0.01, far: 1000, up: [-1, 0, 0], position: [0, 0, 5] }}>
         <Suspense fallback={<LoadingOverlay />}>
-          <SceneContent url={result.ply_url} controlsRef={controlsRef} />
-          <GizmoHelper alignment="bottom-right" margin={[72, 72]}>
+          <SceneContent url={result.ply_url} savedCamera={savedCamera} />
+          <GizmoHelper alignment="bottom-right" margin={[80, 80]}>
             <GizmoViewport
               axisColors={['#f87171', '#4ade80', '#60a5fa']}
               labelColor="white"
@@ -32,6 +32,7 @@ export function PointCloudViewer({ result, onReset }: Props) {
         </Suspense>
       </Canvas>
 
+      {/* Info */}
       <div style={{
         position: 'absolute',
         top: 16,
@@ -45,11 +46,9 @@ export function PointCloudViewer({ result, onReset }: Props) {
         <div style={{ color: '#f1f5f9', fontWeight: 600, marginBottom: 4 }}>DA3-Parallax</div>
         <div>{result.view_count} views · {result.point_count.toLocaleString()} points</div>
         <div>{(result.duration_ms / 1000).toFixed(1)}s reconstruction</div>
-        <div style={{ marginTop: 8, fontSize: 11, color: '#475569' }}>
-          Left drag · rotate &nbsp;·&nbsp; Right drag · pan &nbsp;·&nbsp; Scroll · zoom
-        </div>
       </div>
 
+      {/* Buttons */}
       <div style={{
         position: 'absolute',
         top: 16,
@@ -58,13 +57,45 @@ export function PointCloudViewer({ result, onReset }: Props) {
         gap: 8,
         fontFamily: 'system-ui, sans-serif',
       }}>
-        <button onClick={() => controlsRef.current?.reset()} style={buttonStyle}>
-          Reset view
-        </button>
-        <button onClick={onReset} style={buttonStyle}>
-          Start over
-        </button>
+        <button onClick={() => setShowControls(v => !v)} style={buttonStyle}>Controls</button>
+        <button onClick={handleReset} style={buttonStyle}>Reset view</button>
+        <button onClick={onReset} style={buttonStyle}>Start over</button>
       </div>
+
+      {/* Controls overlay */}
+      {showControls && (
+        <div style={{
+          position: 'absolute',
+          top: 56,
+          right: 16,
+          background: '#1e293b',
+          border: '1px solid #334155',
+          borderRadius: 8,
+          padding: '14px 18px',
+          fontFamily: 'system-ui, sans-serif',
+          fontSize: 13,
+          color: '#cbd5e1',
+          lineHeight: 2,
+          minWidth: 220,
+        }}>
+          <Row label="W / S" value="Move forward / backward" />
+          <Row label="A / D" value="Strafe left / right" />
+          <Row label="Q / E" value="Move up / down" />
+          <Row label="R" value="Reset view" />
+          <Row label="Left drag" value="Rotate" />
+          <Row label="Right drag" value="Pan" />
+          <Row label="Scroll" value="Zoom" />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 24 }}>
+      <span style={{ color: '#f1f5f9', fontWeight: 600, fontFamily: 'monospace', fontSize: 12 }}>{label}</span>
+      <span style={{ color: '#94a3b8' }}>{value}</span>
     </div>
   )
 }
@@ -81,33 +112,93 @@ const buttonStyle: React.CSSProperties = {
 
 interface SceneContentProps {
   url: string
-  controlsRef: React.RefObject<any>
+  savedCamera: React.MutableRefObject<{ pos: THREE.Vector3; quat: THREE.Quaternion; _apply?: boolean } | null>
 }
 
-function SceneContent({ url, controlsRef }: SceneContentProps) {
+function SceneContent({ url, savedCamera }: SceneContentProps) {
   const geometry = useLoader(PLYLoader, url)
   const { camera } = useThree()
-  // Offset to center the cloud without mutating the cached geometry
   const [offset, setOffset] = useState<[number, number, number]>([0, 0, 0])
+  const boundingRadius = useRef(1)
+  const keys = useRef(new Set<string>())
 
   useEffect(() => {
     geometry.computeBoundingSphere()
     const sphere = geometry.boundingSphere!
     const c = sphere.center
-
-    // Center via mesh position, not geometry mutation — safe for useLoader cache
     setOffset([-c.x, -c.y, -c.z])
 
     const r = sphere.radius
-    // Camera already has up=(-1,0,0) from Canvas prop; just set distance
+    boundingRadius.current = r
     camera.position.set(0, 0, r * 2.5)
     camera.lookAt(0, 0, 0)
     camera.near = r * 0.001
     camera.far = r * 20
     camera.updateProjectionMatrix()
 
-    setTimeout(() => controlsRef.current?.saveState(), 0)
-  }, [geometry, camera, controlsRef])
+    savedCamera.current = {
+      pos: camera.position.clone(),
+      quat: camera.quaternion.clone(),
+    }
+  }, [geometry, camera, savedCamera])
+
+  // WASD keyboard listeners
+  useEffect(() => {
+    const onDown = (e: KeyboardEvent) => {
+      if (document.activeElement?.tagName === 'INPUT') return
+      if (e.code === 'KeyR') {
+        if (savedCamera.current) savedCamera.current._apply = true
+        return
+      }
+      keys.current.add(e.code)
+    }
+    const onUp = (e: KeyboardEvent) => keys.current.delete(e.code)
+    window.addEventListener('keydown', onDown)
+    window.addEventListener('keyup', onUp)
+    return () => {
+      window.removeEventListener('keydown', onDown)
+      window.removeEventListener('keyup', onUp)
+    }
+  }, [])
+
+  const _forward = new THREE.Vector3()
+  const _right = new THREE.Vector3()
+  const _delta = new THREE.Vector3()
+
+  useFrame((state, delta) => {
+    if (savedCamera.current?._apply) {
+      savedCamera.current._apply = false
+      camera.position.copy(savedCamera.current.pos)
+      camera.quaternion.copy(savedCamera.current.quat)
+      camera.updateProjectionMatrix()
+      // Reset controls target to origin so orbit is relative to scene center
+      const controls = state.controls as any
+      controls?.target?.set(0, 0, 0)
+    }
+
+    const k = keys.current
+    if (k.size === 0) return
+
+    const speed = boundingRadius.current * 2 * Math.min(delta, 0.05)
+    camera.getWorldDirection(_forward)
+    _right.crossVectors(_forward, camera.up).normalize()
+
+    _delta.set(0, 0, 0)
+    if (k.has('KeyW')) _delta.addScaledVector(_forward, speed)
+    if (k.has('KeyS')) _delta.addScaledVector(_forward, -speed)
+    if (k.has('KeyA')) _delta.addScaledVector(_right, -speed)
+    if (k.has('KeyD')) _delta.addScaledVector(_right, speed)
+    if (k.has('KeyQ')) _delta.addScaledVector(camera.up, speed)
+    if (k.has('KeyE')) _delta.addScaledVector(camera.up, -speed)
+
+    if (_delta.lengthSq() > 0) {
+      camera.position.add(_delta)
+      // Move the orbit target by the same amount so TrackballControls
+      // doesn't fight the camera back to its old orbit center
+      const controls = state.controls as any
+      controls?.target?.add(_delta)
+    }
+  })
 
   const hasColors = !!geometry.attributes.color
 
@@ -121,12 +212,8 @@ function SceneContent({ url, controlsRef }: SceneContentProps) {
           sizeAttenuation
         />
       </points>
-      <TrackballControls
-        ref={controlsRef}
-        rotateSpeed={3}
-        zoomSpeed={1.2}
-        panSpeed={0.8}
-      />
+      {/* makeDefault registers controls in useThree so GizmoHelper can find them */}
+      <TrackballControls makeDefault rotateSpeed={3} zoomSpeed={1.2} panSpeed={0.8} />
     </>
   )
 }
