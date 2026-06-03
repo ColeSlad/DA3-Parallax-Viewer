@@ -46,7 +46,6 @@ _da3_base = (
     .pip_install(
         "torch>=2",
         "torchvision",
-        "xformers",
         extra_index_url="https://download.pytorch.org/whl/cu121",
     )
     .run_commands(
@@ -83,6 +82,7 @@ gsplat_image = (
     image=da3_image,
     gpu="L4",
     volumes={WEIGHTS_DIR: weights_volume},
+    secrets=[modal.Secret.from_name("huggingface-token")],
     timeout=600,  # 10 min; first run downloads ~5 GB weights
     # Keep one container warm to avoid cold starts during iterative tuning
     # (comment out for production scale-to-zero behaviour)
@@ -160,6 +160,7 @@ def reconstruct(
     image=da3_image,
     gpu="L4",
     volumes={WEIGHTS_DIR: weights_volume},
+    secrets=[modal.Secret.from_name("huggingface-token")],
     timeout=600,
 )
 def reconstruct_from_soh(
@@ -250,6 +251,7 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
     image=da3_image,
     gpu="L4",
     volumes={WEIGHTS_DIR: weights_volume},
+    secrets=[modal.Secret.from_name("huggingface-token")],
     timeout=600,
 )
 def reconstruct_from_bytes(
@@ -408,6 +410,7 @@ def validate(
     image=gsplat_image,
     gpu="L4",
     volumes={WEIGHTS_DIR: weights_volume},
+    secrets=[modal.Secret.from_name("huggingface-token")],
     timeout=3600,  # fit can take 20–30 min for large scenes
 )
 def run_splat_pipeline(
