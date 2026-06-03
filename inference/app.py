@@ -69,6 +69,14 @@ da3_image = (
     .add_local_python_source("inference")
 )
 
+# gsplat extends da3_image: adds gsplat (compiled against the same CUDA/torch)
+# and imageio for PNG encoding. Build is cached after first run (~5 min compile).
+gsplat_image = (
+    da3_image
+    .pip_install("gsplat", "imageio[pillow]")
+    # da3_image already has .add_local_python_source("inference"); gsplat_image inherits it.
+)
+
 # ---------------------------------------------------------------------------
 # GPU inference function
 # ---------------------------------------------------------------------------
@@ -391,4 +399,243 @@ def validate(
         f"  Reconstruction time: {metrics['recon_s']} s\n"
         f"  Wall-clock total   : {wall_s:.1f} s\n"
         f"\n  Output: {out_path.resolve()}\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Splat pipeline: Stage 1 (fit) + Stage 2 (insert placeholder)
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=gsplat_image,
+    gpu="L4",
+    volumes={WEIGHTS_DIR: weights_volume},
+    timeout=3600,  # fit can take 20–30 min for large scenes
+)
+def run_splat_pipeline(
+    image_data: list[tuple[str, bytes]] | None = None,  # None → SOH example
+    conf_percentile: float = 25.0,
+    voxel_size: float = 0.02,
+    n_iters: int = 2000,
+    asset_center: tuple[float, float, float] | None = None,  # None → scene centroid
+    asset_size: float = 0.3,
+    asset_color: tuple[float, float, float] = (1.0, 0.1, 0.1),
+    n_orbit_frames: int = 12,
+    snap: bool = False,  # snap asset base to surface below it
+) -> dict:
+    """
+    Full pipeline on GPU:
+      1. DA3 inference
+      2. Point-cloud reconstruction
+      3. Gaussian scene fit (Stage 1)
+      4. Placeholder asset insertion (Stage 2)
+
+    Returns dict with:
+      scene_ply        bytes   3DGS PLY of the fitted scene
+      combined_ply     bytes   3DGS PLY of scene + asset
+      scene_pngs       list[bytes]  orbit PNG frames (scene only)
+      combined_pngs    list[bytes]  orbit PNG frames (scene + asset)
+      metrics          dict
+    """
+    import glob
+    import io
+    import tempfile
+
+    import numpy as np
+    from PIL import Image
+
+    from depth_anything_3.api import DepthAnything3
+    from inference.reconstruction import build_point_cloud
+    from inference.splat_fit import fit_gaussians, render_orbit, write_splat_ply
+    from inference.splat_insert import make_placeholder_cube, merge_gaussians
+    from inference.splat_insert import snap_to_surface as snap_fn
+
+    # --- 1. DA3 inference ---
+    model = DepthAnything3.from_pretrained("depth-anything/DA3-LARGE-1.1", cache_dir=WEIGHTS_DIR)
+    model = model.to("cuda")
+
+    if image_data is None:
+        soh_dir = "/opt/da3/assets/examples/SOH"
+        image_paths = sorted(glob.glob(f"{soh_dir}/*.jpg") + glob.glob(f"{soh_dir}/*.png"))
+        if not image_paths:
+            raise RuntimeError(f"No images in {soh_dir}")
+        pred = model.inference(image_paths)
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_paths = []
+            for name, data in image_data:
+                p = Path(tmp) / name
+                p.write_bytes(data)
+                image_paths.append(str(p))
+            image_paths.sort()
+            pred = model.inference(image_paths)
+
+    depths = np.asarray(pred.depth)
+    confs = np.asarray(pred.conf)
+    intrinsics = np.asarray(pred.intrinsics, dtype=np.float32)
+    extrinsics = np.asarray(pred.extrinsics, dtype=np.float32)
+    images_np = np.asarray(pred.processed_images, dtype=np.uint8)
+    n_views = depths.shape[0]
+    H, W = depths.shape[1], depths.shape[2]
+
+    # --- 2. Point-cloud reconstruction ---
+    result = build_point_cloud(
+        depths=depths, confs=confs, intrinsics=intrinsics,
+        extrinsics=extrinsics, processed_images=images_np,
+        conf_percentile=conf_percentile, voxel_size=voxel_size,
+    )
+    print(f"[splat] {result.voxel_count:,} points after voxel ds")
+
+    # --- 3. Stage 1: fit ---
+    scene = fit_gaussians(
+        xyz=result.xyz, rgb=result.rgb,
+        images=images_np, intrinsics=intrinsics, extrinsics=extrinsics,
+        n_iters=n_iters, init_scale=voxel_size,
+    )
+
+    ref_K = intrinsics[0]  # use first camera's intrinsic for orbit
+    scene_center = result.xyz.mean(axis=0)
+
+    scene_frames = render_orbit(
+        scene, ref_K, (H, W),
+        extrinsics=extrinsics,
+        scene_center=scene_center,
+        n_frames=n_orbit_frames,
+    )
+
+    scene_ply_path = Path("/tmp/scene.ply")
+    write_splat_ply(scene, scene_ply_path)
+    scene_ply_bytes = scene_ply_path.read_bytes()
+
+    # --- 4. Stage 2: asset insertion ---
+    center = tuple(float(v) for v in scene_center) if asset_center is None else asset_center
+
+    if snap:
+        center = snap_fn(center, asset_size, result.xyz)
+        print(f"[splat] snapped asset center to {center}")
+
+    print(f"[splat] placing {asset_size:.3f}-unit cube at {center}, color={asset_color}")
+    asset = make_placeholder_cube(center=center, size=asset_size, color=asset_color)
+    combined = merge_gaussians(scene, asset)
+
+    combined_frames = render_orbit(
+        combined, ref_K, (H, W),
+        extrinsics=extrinsics,
+        scene_center=scene_center,
+        n_frames=n_orbit_frames,
+    )
+
+    combined_ply_path = Path("/tmp/combined.ply")
+    write_splat_ply(combined, combined_ply_path)
+    combined_ply_bytes = combined_ply_path.read_bytes()
+
+    # Encode frames to PNG bytes
+    def to_png(arr: np.ndarray) -> bytes:
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="PNG")
+        return buf.getvalue()
+
+    return {
+        "scene_ply": scene_ply_bytes,
+        "combined_ply": combined_ply_bytes,
+        "scene_pngs": [to_png(f) for f in scene_frames],
+        "combined_pngs": [to_png(f) for f in combined_frames],
+        "metrics": {
+            "n_views": n_views,
+            "n_points": result.voxel_count,
+            "n_scene_gaussians": scene.n,
+            "n_combined_gaussians": combined.n,
+            "asset_center": center,
+            "asset_size": asset_size,
+        },
+    }
+
+
+@app.local_entrypoint()
+def splat_validate(
+    conf_percentile: float = 25.0,
+    voxel_size: float = 0.02,
+    n_iters: int = 2000,
+    asset_x: float = 0.0,
+    asset_y: float = 0.0,
+    asset_z: float = 0.0,
+    asset_size: float = 0.3,
+    snap: bool = False,
+    image_dir: str = "",
+    output_dir: str = "output/splat",
+):
+    """
+    Run the full splat pipeline and save outputs locally.
+
+    Usage:
+        # SOH example scene, asset at scene centroid
+        modal run inference/app.py::splat_validate
+
+        # Custom images, explicit asset position
+        modal run inference/app.py::splat_validate \\
+            --image-dir ./photos \\
+            --asset-x 0.1 --asset-y -0.2 --asset-z 0.0 \\
+            --asset-size 0.3
+
+        # Snap asset base to surface
+        modal run inference/app.py::splat_validate --snap
+    """
+    asset_center = (asset_x, asset_y, asset_z) if (asset_x or asset_y or asset_z) else None
+
+    image_data = None
+    if image_dir:
+        src = Path(image_dir)
+        files = sorted(p for p in src.iterdir() if p.suffix.lower() in _IMAGE_EXTS)
+        if not files:
+            raise SystemExit(f"No images found in {image_dir}")
+        image_data = [(p.name, p.read_bytes()) for p in files]
+        print(f"Loaded {len(files)} images from {src.resolve()}")
+
+    print(f"\n=== Splat pipeline ===")
+    print(f"  iters={n_iters}  voxel={voxel_size}  asset_size={asset_size}")
+    if asset_center:
+        print(f"  asset_center={asset_center}")
+    else:
+        print(f"  asset_center=scene_centroid (auto)")
+
+    result = run_splat_pipeline.remote(
+        image_data=image_data,
+        conf_percentile=conf_percentile,
+        voxel_size=voxel_size,
+        n_iters=n_iters,
+        asset_center=asset_center,
+        asset_size=asset_size,
+        snap=snap,
+    )
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    (out / "scene.ply").write_bytes(result["scene_ply"])
+    (out / "combined.ply").write_bytes(result["combined_ply"])
+
+    scene_dir = out / "scene_orbit"
+    scene_dir.mkdir(exist_ok=True)
+    for i, png in enumerate(result["scene_pngs"]):
+        (scene_dir / f"frame_{i:02d}.png").write_bytes(png)
+
+    combined_dir = out / "combined_orbit"
+    combined_dir.mkdir(exist_ok=True)
+    for i, png in enumerate(result["combined_pngs"]):
+        (combined_dir / f"frame_{i:02d}.png").write_bytes(png)
+
+    m = result["metrics"]
+    print(
+        f"\n=== Results ===\n"
+        f"  Views           : {m['n_views']}\n"
+        f"  Point cloud     : {m['n_points']:,}\n"
+        f"  Scene gaussians : {m['n_scene_gaussians']:,}\n"
+        f"  Combined total  : {m['n_combined_gaussians']:,}\n"
+        f"  Asset center    : {m['asset_center']}\n"
+        f"  Asset size      : {m['asset_size']}\n"
+        f"\n  scene.ply       → {(out / 'scene.ply').resolve()}\n"
+        f"  combined.ply    → {(out / 'combined.ply').resolve()}\n"
+        f"  scene_orbit/    → {scene_dir.resolve()} ({len(result['scene_pngs'])} frames)\n"
+        f"  combined_orbit/ → {combined_dir.resolve()} ({len(result['combined_pngs'])} frames)\n"
     )
