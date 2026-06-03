@@ -38,15 +38,16 @@ WEIGHTS_DIR = "/weights"
 # We use cu121 wheels (CUDA 12.1) which Modal's L4 runtime supports.
 # ---------------------------------------------------------------------------
 
-# Base image: all compiled deps, no local source (so extensions can pip_install
-# additional packages before add_local_python_source, which must come last).
+_TORCH_INDEX = "https://download.pytorch.org/whl/cu124"
+
+# Base image for DA3-only functions: debian slim + torch.
 _da3_base = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "libgl1", "libglib2.0-0")
     .pip_install(
-        "torch>=2",
-        "torchvision",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
+        "torch==2.4.0",
+        "torchvision==0.19.0",
+        extra_index_url=_TORCH_INDEX,
     )
     .run_commands(
         "git clone https://github.com/ByteDance-Seed/Depth-Anything-3 /opt/da3",
@@ -66,10 +67,30 @@ _da3_base = (
 # DA3 inference image (used by reconstruct / reconstruct_from_bytes / reconstruct_from_soh)
 da3_image = _da3_base.add_local_python_source("inference")
 
-# gsplat image: adds gsplat + imageio on top of base, then local source last.
+# gsplat image: built on pytorch/pytorch devel so nvcc is available at image-build
+# time, which lets gsplat compile its CUDA extensions during pip install.
+# Can't inherit _da3_base (debian slim has no nvcc), so we reinstall DA3 deps here.
 gsplat_image = (
-    _da3_base
-    .pip_install("gsplat", "imageio[pillow]")
+    modal.Image.from_registry("pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel")
+    .apt_install("git", "libgl1", "libglib2.0-0")
+    # torch + torchvision are pre-installed and paired in the base image via conda.
+    # Do NOT pip-reinstall torchvision — it overwrites the conda-managed build and
+    # breaks the torchvision C++ extension ABI (causes "operator nms does not exist").
+    .run_commands(
+        "git clone https://github.com/ByteDance-Seed/Depth-Anything-3 /opt/da3",
+        "pip install -e /opt/da3",
+        "pip install opencv-python-headless --upgrade",
+    )
+    .pip_install(
+        "numpy",
+        "open3d",
+        "Pillow",
+        "huggingface_hub",
+        "psycopg2-binary",
+        "boto3",
+        "imageio[pillow]",
+    )
+    .pip_install("gsplat")  # nvcc is in PATH; CUDA extensions compile successfully
     .add_local_python_source("inference")
 )
 
