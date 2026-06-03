@@ -38,10 +38,10 @@ WEIGHTS_DIR = "/weights"
 # We use cu121 wheels (CUDA 12.1) which Modal's L4 runtime supports.
 # ---------------------------------------------------------------------------
 
-da3_image = (
+# Base image: all compiled deps, no local source (so extensions can pip_install
+# additional packages before add_local_python_source, which must come last).
+_da3_base = (
     modal.Image.debian_slim(python_version="3.11")
-    # git for cloning DA3; libgl1 + libglib2.0-0 satisfy opencv's runtime
-    # shared-library deps on a headless Debian image
     .apt_install("git", "libgl1", "libglib2.0-0")
     .pip_install(
         "torch>=2",
@@ -52,8 +52,6 @@ da3_image = (
     .run_commands(
         "git clone https://github.com/ByteDance-Seed/Depth-Anything-3 /opt/da3",
         "pip install -e /opt/da3",
-        # DA3 pulls opencv-python which links against libGL; swap it for the
-        # headless wheel so no display server is needed at runtime
         "pip install opencv-python-headless --upgrade",
     )
     .pip_install(
@@ -61,20 +59,19 @@ da3_image = (
         "open3d",
         "Pillow",
         "huggingface_hub",
-        # DB + R2 deps for the API worker (installed here so worker_image can
-        # extend da3_image with only add_local_python_source at the end)
         "psycopg2-binary",
         "boto3",
     )
-    .add_local_python_source("inference")
 )
 
-# gsplat extends da3_image: adds gsplat (compiled against the same CUDA/torch)
-# and imageio for PNG encoding. Build is cached after first run (~5 min compile).
+# DA3 inference image (used by reconstruct / reconstruct_from_bytes / reconstruct_from_soh)
+da3_image = _da3_base.add_local_python_source("inference")
+
+# gsplat image: adds gsplat + imageio on top of base, then local source last.
 gsplat_image = (
-    da3_image
+    _da3_base
     .pip_install("gsplat", "imageio[pillow]")
-    # da3_image already has .add_local_python_source("inference"); gsplat_image inherits it.
+    .add_local_python_source("inference")
 )
 
 # ---------------------------------------------------------------------------
