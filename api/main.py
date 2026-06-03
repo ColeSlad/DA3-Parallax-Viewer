@@ -57,6 +57,7 @@ def worker(job_id: str) -> None:
     Download images from R2, run DA3 inference, upload PLY, update Postgres.
     Writes nothing back to the API — Postgres is the shared source of truth.
     """
+    import os
     import tempfile
     import time
     import traceback
@@ -114,6 +115,11 @@ def worker(job_id: str) -> None:
         ply_data = ply_to_bytes(result)
         result_key = f"results/{job_id}.ply"
         upload_bytes(r2_client, result_key, ply_data)
+
+        # Delete input images — no longer needed once the PLY is uploaded
+        for key in input_keys:
+            r2_client.delete_object(Bucket=os.environ["R2_BUCKET"], Key=key)
+        print(f"[worker:{job_id}] deleted {len(input_keys)} input images from R2")
 
         duration_ms = int((time.perf_counter() - t0) * 1000)
         sync_update_job(

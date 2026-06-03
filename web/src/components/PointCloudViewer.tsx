@@ -19,7 +19,7 @@ export function PointCloudViewer({ result, onReset }: Props) {
   }
 
   return (
-    <div style={{ width: '100vw', height: '100vh', background: '#0f172a', position: 'relative' }}>
+    <div style={{ position: 'fixed', inset: 0, background: '#0f172a' }}>
       <Canvas camera={{ fov: 60, near: 0.01, far: 1000, up: [-1, 0, 0], position: [0, 0, 5] }}>
         <Suspense fallback={<LoadingOverlay />}>
           <SceneContent url={result.ply_url} savedCamera={savedCamera} />
@@ -121,6 +121,7 @@ function SceneContent({ url, savedCamera }: SceneContentProps) {
   const [offset, setOffset] = useState<[number, number, number]>([0, 0, 0])
   const boundingRadius = useRef(1)
   const keys = useRef(new Set<string>())
+  const needsSave = useRef(false)
 
   useEffect(() => {
     geometry.computeBoundingSphere()
@@ -136,11 +137,9 @@ function SceneContent({ url, savedCamera }: SceneContentProps) {
     camera.far = r * 20
     camera.updateProjectionMatrix()
 
-    savedCamera.current = {
-      pos: camera.position.clone(),
-      quat: camera.quaternion.clone(),
-    }
-  }, [geometry, camera, savedCamera])
+    // Signal the frame loop to saveState once controls are ready
+    needsSave.current = true
+  }, [geometry, camera])
 
   // WASD keyboard listeners
   useEffect(() => {
@@ -153,29 +152,42 @@ function SceneContent({ url, savedCamera }: SceneContentProps) {
       keys.current.add(e.code)
     }
     const onUp = (e: KeyboardEvent) => keys.current.delete(e.code)
+    const clearKeys = () => keys.current.clear()
+
     window.addEventListener('keydown', onDown)
     window.addEventListener('keyup', onUp)
+    window.addEventListener('blur', clearKeys)
+    document.addEventListener('visibilitychange', clearKeys)
     return () => {
       window.removeEventListener('keydown', onDown)
       window.removeEventListener('keyup', onUp)
+      window.removeEventListener('blur', clearKeys)
+      document.removeEventListener('visibilitychange', clearKeys)
     }
   }, [])
 
   const _forward = new THREE.Vector3()
   const _right = new THREE.Vector3()
-  const _delta = new THREE.Vector3()
+  const _move = new THREE.Vector3()
 
   useFrame((state, delta) => {
-    if (savedCamera.current?._apply) {
-      savedCamera.current._apply = false
-      camera.position.copy(savedCamera.current.pos)
-      camera.quaternion.copy(savedCamera.current.quat)
-      camera.updateProjectionMatrix()
-      // Reset controls target to origin so orbit is relative to scene center
-      const controls = state.controls as any
-      controls?.target?.set(0, 0, 0)
+    const controls = state.controls as any
+
+    // Save initial state once controls are ready
+    if (needsSave.current && controls) {
+      needsSave.current = false
+      controls.target.set(0, 0, 0)
+      controls.saveState()
+      savedCamera.current = { pos: new THREE.Vector3(), quat: new THREE.Quaternion(), _apply: false }
     }
 
+    // Reset
+    if (savedCamera.current?._apply) {
+      savedCamera.current._apply = false
+      controls?.reset()
+    }
+
+    // WASD / QE movement
     const k = keys.current
     if (k.size === 0) return
 
@@ -183,20 +195,17 @@ function SceneContent({ url, savedCamera }: SceneContentProps) {
     camera.getWorldDirection(_forward)
     _right.crossVectors(_forward, camera.up).normalize()
 
-    _delta.set(0, 0, 0)
-    if (k.has('KeyW')) _delta.addScaledVector(_forward, speed)
-    if (k.has('KeyS')) _delta.addScaledVector(_forward, -speed)
-    if (k.has('KeyA')) _delta.addScaledVector(_right, -speed)
-    if (k.has('KeyD')) _delta.addScaledVector(_right, speed)
-    if (k.has('KeyQ')) _delta.addScaledVector(camera.up, speed)
-    if (k.has('KeyE')) _delta.addScaledVector(camera.up, -speed)
+    _move.set(0, 0, 0)
+    if (k.has('KeyW')) _move.addScaledVector(_forward, speed)
+    if (k.has('KeyS')) _move.addScaledVector(_forward, -speed)
+    if (k.has('KeyA')) _move.addScaledVector(_right, -speed)
+    if (k.has('KeyD')) _move.addScaledVector(_right, speed)
+    if (k.has('KeyQ')) _move.addScaledVector(camera.up, speed)
+    if (k.has('KeyE')) _move.addScaledVector(camera.up, -speed)
 
-    if (_delta.lengthSq() > 0) {
-      camera.position.add(_delta)
-      // Move the orbit target by the same amount so TrackballControls
-      // doesn't fight the camera back to its old orbit center
-      const controls = state.controls as any
-      controls?.target?.add(_delta)
+    if (_move.lengthSq() > 0) {
+      camera.position.add(_move)
+      controls?.target?.add(_move)
     }
   })
 
@@ -213,7 +222,8 @@ function SceneContent({ url, savedCamera }: SceneContentProps) {
         />
       </points>
       {/* makeDefault registers controls in useThree so GizmoHelper can find them */}
-      <TrackballControls makeDefault rotateSpeed={3} zoomSpeed={1.2} panSpeed={0.8} />
+      {/* keys={['','','']} prevents TrackballControls from intercepting A/S/D (its default pan/rotate/zoom keys), which caused double-movement during WASD+drag */}
+      <TrackballControls makeDefault rotateSpeed={3} zoomSpeed={1.2} panSpeed={0.8} staticMoving keys={['', '', '']} />
     </>
   )
 }
