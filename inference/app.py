@@ -26,6 +26,10 @@ app = modal.App("da3-parallax")
 weights_volume = modal.Volume.from_name("da3-weights", create_if_missing=True)
 WEIGHTS_DIR = "/weights"
 
+# Persistent volume for TRELLIS + SDXL-Turbo weights (~20 GB total on first run)
+trellis_weights_volume = modal.Volume.from_name("trellis-weights", create_if_missing=True)
+TRELLIS_WEIGHTS_DIR = "/trellis-weights"
+
 # ---------------------------------------------------------------------------
 # Container image
 #
@@ -98,6 +102,54 @@ gsplat_image = (
         "imageio[pillow]",
     )
     .pip_install("gsplat")  # nvcc is in PATH; CUDA extensions compile correctly
+    .add_local_python_source("inference")
+)
+
+# TRELLIS image: TRELLIS text/image-to-3D Gaussian generation.
+#
+# Key deps:
+#   spconv-cu124 : sparse 3D convolutions for TRELLIS's structured latent model
+#   diffusers    : SDXL-Turbo text-to-image (text path) + TRELLIS internal pipelines
+#   transformers : image encoder (DINO/SigLIP) used by TRELLIS
+#   rembg        : background removal before TRELLIS (preprocess_image=True)
+#
+# TRELLIS is installed --no-deps so we control the dep graph and avoid
+# torch version clobbering. The explicit dep list above covers what we need
+# for Gaussian output; mesh/nvdiffrast deps are intentionally omitted.
+#
+# GPU: L4 (24 GB) fits TRELLIS-image-large (~16 GB peak) + SDXL-Turbo (~4 GB)
+# sequentially. If OOM, bump to gpu="A100".
+trellis_image = (
+    modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11")
+    .apt_install("git", "libgl1", "libglib2.0-0")
+    .pip_install(
+        "torch==2.4.0",
+        "torchvision==0.19.0",
+        extra_index_url=_TORCH_INDEX,
+    )
+    # spconv must be installed before TRELLIS so TRELLIS can import it
+    .pip_install("spconv-cu124")
+    .pip_install(
+        "diffusers>=0.28.0",
+        "transformers>=4.40.0",
+        "accelerate>=0.30.0",
+        "einops",
+        "easydict",
+        "trimesh",
+        "plyfile",
+        "imageio[pillow]",
+        "rembg",
+        "scipy",
+        "numpy",
+        "Pillow",
+        "huggingface_hub",
+    )
+    .run_commands(
+        # Install TRELLIS without letting it clobber our pinned torch
+        "pip install git+https://github.com/microsoft/TRELLIS.git --no-deps",
+        # Re-pin torch in case any step above upgraded it
+        f"pip install torch==2.4.0 torchvision==0.19.0 --extra-index-url {_TORCH_INDEX}",
+    )
     .add_local_python_source("inference")
 )
 
@@ -666,4 +718,340 @@ def splat_validate(
         f"  combined.ply    → {(out / 'combined.ply').resolve()}\n"
         f"  scene_orbit/    → {scene_dir.resolve()} ({len(result['scene_pngs'])} frames)\n"
         f"  combined_orbit/ → {combined_dir.resolve()} ({len(result['combined_pngs'])} frames)\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# TRELLIS asset generation: its own Modal GPU function
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=trellis_image,
+    gpu="L4",  # 24 GB; fits TRELLIS-large (~16 GB) + SDXL-Turbo (~4 GB) sequentially
+    volumes={TRELLIS_WEIGHTS_DIR: trellis_weights_volume},
+    secrets=[modal.Secret.from_name("huggingface-token")],
+    timeout=1800,  # 30 min: first run downloads TRELLIS (~15 GB) + SDXL-Turbo weights
+)
+def generate_asset(
+    prompt: str,
+    image_bytes: bytes | None = None,
+    seed: int = 42,
+) -> dict:
+    """
+    Generate 3D Gaussians from a text prompt (or image) using TRELLIS.
+
+    Text path:  SDXL-Turbo generates an image, then TRELLIS converts to 3D.
+    Image path: TRELLIS converts the provided image bytes directly.
+
+    Returns a dict of numpy arrays representing the GaussianScene in TRELLIS
+    canonical frame (Y-up, ~[-0.5,0.5]^3). The caller must run
+    run_trellis_pipeline() (or equivalent) to place it in the scene world frame.
+
+    GPU note: L4 (24 GB) should be sufficient. If OOM, change gpu="A100".
+    """
+    from inference.splat_trellis import generate_asset_gaussians, gaussianscene_to_dict
+
+    gs = generate_asset_gaussians(
+        prompt=prompt,
+        image_bytes=image_bytes,
+        seed=seed,
+        weights_dir=TRELLIS_WEIGHTS_DIR,
+    )
+    print(f"[generate_asset] {gs.n:,} gaussians — returning to caller")
+    return {**gaussianscene_to_dict(gs), "n_gaussians": gs.n, "prompt": prompt}
+
+
+# ---------------------------------------------------------------------------
+# TRELLIS pipeline: DA3 + gsplat fit + place generated asset + render
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=gsplat_image,
+    gpu="L4",
+    volumes={WEIGHTS_DIR: weights_volume},
+    secrets=[modal.Secret.from_name("huggingface-token")],
+    timeout=3600,
+)
+def run_trellis_pipeline(
+    asset_data: dict,                                    # from generate_asset()
+    image_data: list[tuple[str, bytes]] | None = None,  # None → SOH example
+    conf_percentile: float = 25.0,
+    voxel_size: float = 0.02,
+    n_iters: int = 2000,
+    asset_center: tuple[float, float, float] | None = None,  # None → scene centroid
+    asset_size: float = 0.3,
+    n_orbit_frames: int = 12,
+    snap: bool = True,
+) -> dict:
+    """
+    Full pipeline on GPU:
+      1. DA3 inference + point-cloud reconstruction
+      2. Gaussian scene fit (Stage 1) via gsplat
+      3. Place generated TRELLIS asset into scene world frame (Stage 2)
+      4. Merge + render orbit views
+
+    asset_data is the dict returned by generate_asset() — numpy arrays
+    representing the asset in TRELLIS canonical frame (Y-up, unit scale).
+    place_asset() handles axis alignment to the scene world frame.
+
+    Returns the same dict format as run_splat_pipeline():
+      scene_ply, combined_ply, scene_pngs, combined_pngs, metrics
+    """
+    import glob
+    import io
+    import tempfile
+
+    import numpy as np
+    from PIL import Image
+
+    from depth_anything_3.api import DepthAnything3
+    from inference.reconstruction import build_point_cloud
+    from inference.splat_fit import fit_gaussians, render_orbit, write_splat_ply, _infer_world_up
+    from inference.splat_insert import place_asset, merge_gaussians
+    from inference.splat_trellis import dict_to_gaussianscene
+
+    # --- 1. DA3 inference ---
+    model = DepthAnything3.from_pretrained("depth-anything/DA3-LARGE-1.1", cache_dir=WEIGHTS_DIR)
+    model = model.to("cuda")
+
+    if image_data is None:
+        soh_dir = "/opt/da3/assets/examples/SOH"
+        image_paths = sorted(glob.glob(f"{soh_dir}/*.jpg") + glob.glob(f"{soh_dir}/*.png"))
+        if not image_paths:
+            raise RuntimeError(f"No images in {soh_dir}")
+        pred = model.inference(image_paths)
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            image_paths = []
+            for name, data in image_data:
+                p = Path(tmp) / name
+                p.write_bytes(data)
+                image_paths.append(str(p))
+            image_paths.sort()
+            pred = model.inference(image_paths)
+
+    depths = np.asarray(pred.depth)
+    confs = np.asarray(pred.conf)
+    intrinsics = np.asarray(pred.intrinsics, dtype=np.float32)
+    extrinsics = np.asarray(pred.extrinsics, dtype=np.float32)
+    images_np = np.asarray(pred.processed_images, dtype=np.uint8)
+    n_views = depths.shape[0]
+    H, W = depths.shape[1], depths.shape[2]
+
+    # --- 2. Point-cloud reconstruction ---
+    result = build_point_cloud(
+        depths=depths, confs=confs, intrinsics=intrinsics,
+        extrinsics=extrinsics, processed_images=images_np,
+        conf_percentile=conf_percentile, voxel_size=voxel_size,
+    )
+    print(f"[trellis_pipeline] {result.voxel_count:,} points after voxel ds")
+
+    # --- 3. Stage 1: Gaussian scene fit ---
+    scene = fit_gaussians(
+        xyz=result.xyz, rgb=result.rgb,
+        images=images_np, intrinsics=intrinsics, extrinsics=extrinsics,
+        n_iters=n_iters, init_scale=voxel_size,
+    )
+
+    ref_K = intrinsics[0]
+    scene_center = result.xyz.mean(axis=0)
+
+    scene_frames = render_orbit(
+        scene, ref_K, (H, W),
+        extrinsics=extrinsics,
+        scene_center=scene_center,
+        n_frames=n_orbit_frames,
+    )
+
+    scene_ply_path = Path("/tmp/scene.ply")
+    write_splat_ply(scene, scene_ply_path)
+    scene_ply_bytes = scene_ply_path.read_bytes()
+
+    # --- 4. Stage 2: place TRELLIS asset in scene world frame ---
+    # Axis alignment: TRELLIS Y-up → scene world_up (inferred from camera poses)
+    world_up = _infer_world_up(extrinsics)
+    print(f"[trellis_pipeline] world_up={world_up.tolist()}")
+
+    center = tuple(float(v) for v in scene_center) if asset_center is None else asset_center
+    asset_gs = dict_to_gaussianscene(asset_data)
+
+    placed = place_asset(
+        asset=asset_gs,
+        target_center=center,
+        target_size=asset_size,
+        world_up=world_up,
+        snap_xyz=result.xyz if snap else None,
+    )
+    print(
+        f"[trellis_pipeline] placed {placed.n:,} asset gaussians at {center}"
+        f"  size={asset_size:.3f}m  prompt={asset_data.get('prompt', '')!r}"
+    )
+
+    combined = merge_gaussians(scene, placed)
+
+    combined_frames = render_orbit(
+        combined, ref_K, (H, W),
+        extrinsics=extrinsics,
+        scene_center=scene_center,
+        n_frames=n_orbit_frames,
+    )
+
+    combined_ply_path = Path("/tmp/combined.ply")
+    write_splat_ply(combined, combined_ply_path)
+    combined_ply_bytes = combined_ply_path.read_bytes()
+
+    def to_png(arr: np.ndarray) -> bytes:
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="PNG")
+        return buf.getvalue()
+
+    return {
+        "scene_ply": scene_ply_bytes,
+        "combined_ply": combined_ply_bytes,
+        "scene_pngs": [to_png(f) for f in scene_frames],
+        "combined_pngs": [to_png(f) for f in combined_frames],
+        "metrics": {
+            "n_views": n_views,
+            "n_points": result.voxel_count,
+            "n_scene_gaussians": scene.n,
+            "n_asset_gaussians": placed.n,
+            "n_combined_gaussians": combined.n,
+            "asset_center": center,
+            "asset_size": asset_size,
+            "world_up": world_up.tolist(),
+            "prompt": asset_data.get("prompt", ""),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Local entrypoint: text prompt → placed asset → orbit renders + PLY
+# ---------------------------------------------------------------------------
+
+
+@app.local_entrypoint()
+def trellis_insert(
+    prompt: str = "a small potted plant",
+    image: str = "",          # path to image file; overrides prompt if set
+    asset_x: float = 0.0,
+    asset_y: float = 0.0,
+    asset_z: float = 0.0,
+    asset_size: float = 0.3,  # target real-world bounding box in meters
+    snap: bool = True,        # snap asset base to scene surface
+    seed: int = 42,
+    n_iters: int = 2000,
+    image_dir: str = "",      # scene images; empty → SOH example
+    output_dir: str = "output/trellis",
+):
+    """
+    Generate a text-prompted 3D asset, place it in the example scene, and save
+    orbit renders and combined PLY locally.
+
+    Two Modal GPU functions run in sequence:
+      1. generate_asset  (trellis_image, L4): text → SDXL-Turbo → TRELLIS → Gaussians
+      2. run_trellis_pipeline (gsplat_image, L4): DA3 + fit + place + merge + render
+
+    Usage:
+        # Default: "a small potted plant" placed at scene centroid
+        modal run inference/app.py::trellis_insert
+
+        # Custom prompt and explicit placement
+        modal run inference/app.py::trellis_insert \\
+            --prompt "a red fire hydrant" \\
+            --asset-x 0.1 --asset-y -0.2 --asset-size 0.4
+
+        # Use an input image instead of text-to-image
+        modal run inference/app.py::trellis_insert \\
+            --image ./my_object.jpg
+
+        # Custom scene images
+        modal run inference/app.py::trellis_insert \\
+            --image-dir ./photos --prompt "a ceramic mug"
+    """
+    asset_center = (asset_x, asset_y, asset_z) if (asset_x or asset_y or asset_z) else None
+    image_bytes: bytes | None = None
+    if image:
+        p = Path(image)
+        if not p.is_file():
+            raise SystemExit(f"--image {image!r} not found")
+        image_bytes = p.read_bytes()
+        print(f"Using image input: {p.name} ({len(image_bytes)//1024} KB)")
+    else:
+        print(f"Using text prompt: {prompt!r}")
+
+    scene_image_data = None
+    if image_dir:
+        src = Path(image_dir)
+        files = sorted(p for p in src.iterdir() if p.suffix.lower() in _IMAGE_EXTS)
+        if not files:
+            raise SystemExit(f"No images found in {image_dir}")
+        scene_image_data = [(p.name, p.read_bytes()) for p in files]
+        print(f"Loaded {len(files)} scene images from {src.resolve()}")
+
+    print(f"\n=== TRELLIS insert pipeline ===")
+    print(f"  prompt    : {prompt!r}")
+    print(f"  asset_size: {asset_size} m")
+    print(f"  asset_center: {asset_center or 'scene centroid (auto)'}")
+    print(f"  snap      : {snap}")
+    print(f"  iters     : {n_iters}")
+
+    # Step 1: generate asset Gaussians (TRELLIS container)
+    print("\n[1/2] Generating 3D asset ...")
+    t0 = time.perf_counter()
+    asset_data = generate_asset.remote(
+        prompt=prompt,
+        image_bytes=image_bytes,
+        seed=seed,
+    )
+    gen_s = time.perf_counter() - t0
+    print(f"      → {asset_data['n_gaussians']:,} gaussians in {gen_s:.1f}s")
+
+    # Step 2: scene fit + place + render (gsplat container)
+    print("\n[2/2] Fitting scene and placing asset ...")
+    t1 = time.perf_counter()
+    result = run_trellis_pipeline.remote(
+        asset_data=asset_data,
+        image_data=scene_image_data,
+        n_iters=n_iters,
+        asset_center=asset_center,
+        asset_size=asset_size,
+        snap=snap,
+    )
+    pipeline_s = time.perf_counter() - t1
+
+    # Save outputs
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    (out / "scene.ply").write_bytes(result["scene_ply"])
+    (out / "combined.ply").write_bytes(result["combined_ply"])
+
+    scene_dir = out / "scene_orbit"
+    scene_dir.mkdir(exist_ok=True)
+    for i, png in enumerate(result["scene_pngs"]):
+        (scene_dir / f"frame_{i:02d}.png").write_bytes(png)
+
+    combined_dir = out / "combined_orbit"
+    combined_dir.mkdir(exist_ok=True)
+    for i, png in enumerate(result["combined_pngs"]):
+        (combined_dir / f"frame_{i:02d}.png").write_bytes(png)
+
+    m = result["metrics"]
+    print(
+        f"\n=== Results ===\n"
+        f"  Prompt           : {m['prompt']!r}\n"
+        f"  Asset gaussians  : {m['n_asset_gaussians']:,}\n"
+        f"  Scene gaussians  : {m['n_scene_gaussians']:,}\n"
+        f"  Combined total   : {m['n_combined_gaussians']:,}\n"
+        f"  Asset center     : {m['asset_center']}\n"
+        f"  Asset size       : {m['asset_size']} m\n"
+        f"  World up         : {m['world_up']}\n"
+        f"  Generation time  : {gen_s:.1f} s\n"
+        f"  Pipeline time    : {pipeline_s:.1f} s\n"
+        f"\n  scene.ply        → {(out / 'scene.ply').resolve()}\n"
+        f"  combined.ply     → {(out / 'combined.ply').resolve()}\n"
+        f"  scene_orbit/     → {scene_dir.resolve()} ({len(result['scene_pngs'])} frames)\n"
+        f"  combined_orbit/  → {combined_dir.resolve()} ({len(result['combined_pngs'])} frames)\n"
     )
