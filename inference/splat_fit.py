@@ -258,6 +258,130 @@ def render_orbit(
     return frames
 
 
+def render_from_cameras(
+    scene: GaussianScene,
+    intrinsics: np.ndarray,   # (V, 3, 3)
+    extrinsics: np.ndarray,   # (V, 3, 4) world-to-cam [R|t]
+    image_hw: tuple[int, int],
+    device: str = "cuda",
+) -> list[np.ndarray]:
+    """Render scene from the actual training camera positions.
+
+    Unlike render_orbit, this only uses viewpoints where the scene was observed,
+    so it avoids the degenerate streaks that appear from unseen angles in
+    sparse (2–4 view) scenes.
+    """
+    from gsplat import rasterization
+
+    H, W = image_hw
+    means_t = scene.means.to(device)
+    quats_t = scene.quats.to(device)
+    scales_t = torch.exp(scene.log_scales).to(device)
+    opacities_t = torch.sigmoid(scene.logit_opacities).to(device)
+    colors_t = torch.sigmoid(scene.raw_colors).to(device)
+
+    frames: list[np.ndarray] = []
+    for i in range(len(extrinsics)):
+        # Pad 3×4 → 4×4
+        vm = np.eye(4, dtype=np.float32)
+        vm[:3, :] = extrinsics[i]
+        vm_t = torch.from_numpy(vm).unsqueeze(0).to(device)
+        K_t = torch.from_numpy(intrinsics[i].astype(np.float32)).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            renders, _, _ = rasterization(
+                means=means_t, quats=quats_t, scales=scales_t,
+                opacities=opacities_t, colors=colors_t,
+                viewmats=vm_t, Ks=K_t, width=W, height=H, packed=False,
+                backgrounds=torch.ones(1, 3, device=device),
+            )
+        frames.append((renders[0].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8))
+
+    return frames
+
+
+def render_around_asset(
+    scene: GaussianScene,
+    asset_center: np.ndarray,   # (3,) world-space center of the asset
+    asset_size: float,          # bounding box diameter (meters / scene units)
+    ref_intrinsic: np.ndarray,  # (3, 3) from one training camera
+    image_hw: tuple[int, int],
+    world_up: np.ndarray,
+    n_frames: int = 8,
+    elevation_deg: float = 20.0,
+    device: str = "cuda",
+) -> list[np.ndarray]:
+    """Orbit closely around the placed asset so its quality is clearly visible.
+
+    Uses a radius of 3× the asset size and adjusts focal length so the asset
+    fills roughly half the frame, regardless of scene scale.
+    """
+    from gsplat import rasterization
+
+    H, W = image_hw
+    radius = asset_size * 3.0
+
+    # Scale focal length so asset_size subtends ~half the frame width
+    # f = (W/2) / tan(half_fov);  half_fov = atan(asset_size/2 / radius)
+    import math as _math
+    half_angle = _math.atan((asset_size / 2.0) / radius)
+    f_asset = (W / 2.0) / _math.tan(half_angle)
+    cx, cy = W / 2.0, H / 2.0
+    K_asset = np.array([[f_asset, 0, cx], [0, f_asset, cy], [0, 0, 1]], dtype=np.float32)
+
+    means_t = scene.means.to(device)
+    quats_t = scene.quats.to(device)
+    scales_t = torch.exp(scene.log_scales).to(device)
+    opacities_t = torch.sigmoid(scene.logit_opacities).to(device)
+    colors_t = torch.sigmoid(scene.raw_colors).to(device)
+    K_t = torch.from_numpy(K_asset).unsqueeze(0).to(device)
+
+    el = _math.radians(elevation_deg)
+    frames: list[np.ndarray] = []
+
+    for i in range(n_frames):
+        az = 2 * _math.pi * i / n_frames
+
+        cam_pos = asset_center + np.array([
+            radius * _math.cos(el) * _math.cos(az),
+            radius * _math.cos(el) * _math.sin(az),
+            radius * _math.sin(el),
+        ], dtype=np.float32)
+
+        fwd = asset_center - cam_pos
+        fwd /= np.linalg.norm(fwd)
+
+        up = world_up - np.dot(world_up, fwd) * fwd
+        up_norm = np.linalg.norm(up)
+        if up_norm < 1e-6:
+            up = np.array([0., 1., 0.], dtype=np.float32)
+            up -= np.dot(up, fwd) * fwd
+            up /= np.linalg.norm(up)
+        else:
+            up /= up_norm
+
+        right = np.cross(fwd, up)
+        right /= np.linalg.norm(right)
+        up = np.cross(right, fwd)
+
+        R = np.stack([right, -up, fwd], axis=0)
+        t = -R @ cam_pos
+        vm = np.eye(4, dtype=np.float32)
+        vm[:3, :3] = R; vm[:3, 3] = t
+        vm_t = torch.from_numpy(vm).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            renders, _, _ = rasterization(
+                means=means_t, quats=quats_t, scales=scales_t,
+                opacities=opacities_t, colors=colors_t,
+                viewmats=vm_t, Ks=K_t, width=W, height=H, packed=False,
+                backgrounds=torch.ones(1, 3, device=device),
+            )
+        frames.append((renders[0].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8))
+
+    return frames
+
+
 # ---------------------------------------------------------------------------
 # PLY export (3DGS / SuperSplat format)
 # ---------------------------------------------------------------------------

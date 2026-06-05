@@ -232,6 +232,15 @@ def place_asset(
     # Gaussian splat sizes scale the same way: add log(target_size / extent)
     scale_factor = target_size / extent
     log_scales = asset.log_scales + math.log(max(scale_factor, 1e-8))
+    # Hard ceiling: no single Gaussian wider than 10% of the target bounding box.
+    # Prevents large structural splats from rendering as a featureless blob.
+    max_log_scale = math.log(target_size * 0.10)
+    log_scales = log_scales.clamp(max=max_log_scale)
+    print(
+        f"[place_asset] extent={extent:.4f}  scale_factor={scale_factor:.4f}  "
+        f"log_scale range [{log_scales.min():.2f}, {log_scales.max():.2f}]  "
+        f"linear scale range [{log_scales.exp().min():.4f}m, {log_scales.exp().max():.4f}m]"
+    )
 
     # 5. Translate to target_center (optionally snapping base to surface)
     center = np.array(target_center, dtype=np.float32)

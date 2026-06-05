@@ -56,6 +56,35 @@ def _extract_trellis_gaussians(gs) -> GaussianScene:
     color_01 = (SH_C0 * f_dc + 0.5).clamp(1e-3, 1 - 1e-3)
     raw_colors = torch.log(color_01 / (1 - color_01))                 # (N, 3) logit
 
+    # Step 1: prune floaters — large-scale Gaussians and near-transparent splats
+    # cause light-streak artifacts. Cap at 90th-percentile max log-scale + opacity floor.
+    max_s = log_scales.max(dim=-1).values          # (N,) per-splat max log-scale
+    opacity = torch.sigmoid(logit_opacities)        # (N,) in [0, 1]
+    scale_cap = torch.quantile(max_s, 0.90)
+    keep = (max_s <= scale_cap) & (opacity > 0.05)
+
+    means = means[keep]; quats = quats[keep]
+    log_scales = log_scales[keep]; logit_opacities = logit_opacities[keep]
+    raw_colors = raw_colors[keep]; opacity = opacity[keep]
+
+    # Step 2: subsample to at most MAX_GAUSSIANS keeping the most opaque splats.
+    # Opacity-sorted is safe here because place_asset hard-clamps scale, so
+    # selecting high-opacity Gaussians no longer risks keeping giant blobs.
+    MAX_GAUSSIANS = 30_000
+    n_after_filter = means.shape[0]
+    if n_after_filter > MAX_GAUSSIANS:
+        topk_idx = torch.topk(opacity, MAX_GAUSSIANS).indices
+        means = means[topk_idx]; quats = quats[topk_idx]
+        log_scales = log_scales[topk_idx]; logit_opacities = logit_opacities[topk_idx]
+        raw_colors = raw_colors[topk_idx]
+
+    n_final = means.shape[0]
+    print(
+        f"[trellis] {gs._xyz.shape[0]:,} raw  "
+        f"→ {n_after_filter:,} after filter (scale_cap={scale_cap.item():.3f})  "
+        f"→ {n_final:,} after subsample"
+    )
+
     return GaussianScene(
         means=means,
         quats=quats,
@@ -100,14 +129,16 @@ def generate_asset_gaussians(
     image_bytes: bytes | None = None,
     seed: int = 42,
     weights_dir: str = "/trellis-weights",
-) -> GaussianScene:
+) -> tuple["GaussianScene", bytes]:
     """
     Generate 3D Gaussians from a text prompt or image using TRELLIS.
 
     Text path:  SDXL-Turbo generates an image → TRELLIS converts to 3D.
     Image path: TRELLIS converts the provided image directly.
 
-    Returns GaussianScene in TRELLIS canonical frame (Y-up, ~[-0.5,0.5]^3).
+    Returns (GaussianScene, image_png_bytes) — the GaussianScene in TRELLIS
+    canonical frame (Y-up, ~[-0.5,0.5]^3) and the PNG bytes of the image that
+    was fed into TRELLIS (for inspection / diagnostics).
     The caller must run splat_insert.place_asset() to bring into scene frame.
 
     Weights are cached in `weights_dir` (Modal Volume mount point).
@@ -118,17 +149,22 @@ def generate_asset_gaussians(
     if image_bytes is not None:
         print(f"[trellis] image-to-3D  ({len(image_bytes) // 1024} KB input)")
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        input_image_bytes = image_bytes  # return the caller's image unchanged
     else:
         print(f"[trellis] text-to-3D  prompt={prompt!r}")
         image = _text_to_image(prompt, cache_dir=weights_dir)
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        input_image_bytes = buf.getvalue()
 
     # Deferred import: trellis is only installed in the trellis_image container
     from trellis.pipelines import TrellisImageTo3DPipeline  # noqa: PLC0415
 
     print("[trellis] loading TRELLIS pipeline ...")
+    # from_pretrained only accepts path: str — no cache_dir param.
+    # HF_HOME is already set above so hf_hub_download caches to our volume.
     pipeline = TrellisImageTo3DPipeline.from_pretrained(
         "JeffreyXiang/TRELLIS-image-large",
-        cache_dir=weights_dir,
     )
     pipeline.cuda()
     print("[trellis] pipeline ready")
@@ -150,7 +186,7 @@ def generate_asset_gaussians(
     del pipeline, gs, outputs
     torch.cuda.empty_cache()
 
-    return result
+    return result, input_image_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +209,12 @@ def _text_to_image(prompt: str, cache_dir: str) -> Image.Image:
     )
     pipe = pipe.to("cuda")
 
+    # Wrap the prompt to bias toward a clean single-object render; TRELLIS
+    # background-removes the result, so a neutral-bg product-photo style helps.
+    wrapped = f"{prompt}, single object, white background, product photo, centered"
     with torch.inference_mode():
         result = pipe(
-            prompt=prompt,
+            prompt=wrapped,
             num_inference_steps=4,  # turbo: 1–4 steps sufficient
             guidance_scale=0.0,     # distilled model; CFG not needed
             width=512,

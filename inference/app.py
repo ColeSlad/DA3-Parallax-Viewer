@@ -130,26 +130,64 @@ trellis_image = (
     # spconv must be installed before TRELLIS so TRELLIS can import it
     .pip_install("spconv-cu124")
     .pip_install(
-        "diffusers>=0.28.0",
-        "transformers>=4.40.0",
-        "accelerate>=0.30.0",
-        "einops",
-        "easydict",
-        "trimesh",
-        "plyfile",
+        # Pin to torch-2.4.0-era versions.
+        # transformers >=4.46 requires torch.float8_e8m0fnu (added in torch 2.5).
+        "diffusers==0.30.3",
+        "transformers==4.44.2",
+        "accelerate==0.34.2",
+        # TRELLIS --basic deps (from setup.sh)
         "imageio[pillow]",
-        "rembg",
+        "imageio-ffmpeg",
+        "tqdm",
+        "easydict",
+        "opencv-python-headless",
         "scipy",
+        "ninja",
+        "rembg[cpu]",   # plain rembg has no onnxruntime backend; [cpu] adds onnxruntime
+        "onnxruntime",  # explicit in case rembg[cpu] doesn't pull it
+        "trimesh",
+        "open3d",
+        "xatlas",
+        "pyvista",
+        "pymeshfix",
+        "igraph",
+        "einops",
+        "plyfile",
         "numpy",
         "Pillow",
         "huggingface_hub",
     )
     .run_commands(
-        # Install TRELLIS without letting it clobber our pinned torch
-        "pip install git+https://github.com/microsoft/TRELLIS.git --no-deps",
-        # Re-pin torch in case any step above upgraded it
+        # utils3d: pinned commit from TRELLIS's own setup.sh
+        "pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8",
+        # xformers: needed for sparse attention (trellis/modules/sparse/attention).
+        # That module only accepts 'xformers' or 'flash_attn'; 'sdpa' is not an option.
+        # cu121 wheel works on CUDA 12.4 (CUDA runtime is forward-compatible).
+        "pip install xformers==0.0.27.post2 --extra-index-url https://download.pytorch.org/whl/cu121",
+        # kaolin: needed because flexicubes (a git submodule of TRELLIS) does
+        #   `from kaolin.utils.testing import check_tensor` at module level.
+        # trellis/representations/__init__.py imports MeshExtractResult eagerly,
+        # so this import fires even when formats=["gaussian"] only.
+        # NVIDIA only ships torch-2.4.0_cu121 wheel; it works on CUDA 12.4.
+        "pip install kaolin -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu121.html",
+        # Clone TRELLIS with submodules: flexicubes lives at
+        #   trellis/representations/mesh/flexicubes (git submodule).
+        # Without --recurse-submodules the flexicubes directory is empty and
+        # the import fails. --shallow-submodules keeps the clone fast.
+        "git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/microsoft/TRELLIS /opt/trellis",
+        # Re-pin torch in case kaolin or any other step upgraded it
         f"pip install torch==2.4.0 torchvision==0.19.0 --extra-index-url {_TORCH_INDEX}",
     )
+    .env({
+        "PYTHONPATH": "/opt/trellis",
+        # Regular attention (trellis/modules/attention): sdpa uses torch's built-in
+        # scaled_dot_product_attention, no extra package needed.
+        "ATTN_BACKEND": "sdpa",
+        # Sparse attention (trellis/modules/sparse/attention): only accepts
+        # 'xformers' or 'flash_attn' — sdpa is not supported there.
+        # xformers is installed above; this env var selects it.
+        "SPARSE_ATTN_BACKEND": "xformers",
+    })
     .add_local_python_source("inference")
 )
 
@@ -752,14 +790,19 @@ def generate_asset(
     """
     from inference.splat_trellis import generate_asset_gaussians, gaussianscene_to_dict
 
-    gs = generate_asset_gaussians(
+    gs, input_image_png = generate_asset_gaussians(
         prompt=prompt,
         image_bytes=image_bytes,
         seed=seed,
         weights_dir=TRELLIS_WEIGHTS_DIR,
     )
     print(f"[generate_asset] {gs.n:,} gaussians — returning to caller")
-    return {**gaussianscene_to_dict(gs), "n_gaussians": gs.n, "prompt": prompt}
+    return {
+        **gaussianscene_to_dict(gs),
+        "n_gaussians": gs.n,
+        "prompt": prompt,
+        "input_image_png": input_image_png,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +825,6 @@ def run_trellis_pipeline(
     n_iters: int = 2000,
     asset_center: tuple[float, float, float] | None = None,  # None → scene centroid
     asset_size: float = 0.3,
-    n_orbit_frames: int = 12,
     snap: bool = True,
 ) -> dict:
     """
@@ -808,7 +850,7 @@ def run_trellis_pipeline(
 
     from depth_anything_3.api import DepthAnything3
     from inference.reconstruction import build_point_cloud
-    from inference.splat_fit import fit_gaussians, render_orbit, write_splat_ply, _infer_world_up
+    from inference.splat_fit import fit_gaussians, render_from_cameras, render_around_asset, write_splat_ply, _infer_world_up
     from inference.splat_insert import place_asset, merge_gaussians
     from inference.splat_trellis import dict_to_gaussianscene
 
@@ -855,15 +897,9 @@ def run_trellis_pipeline(
         n_iters=n_iters, init_scale=voxel_size,
     )
 
-    ref_K = intrinsics[0]
     scene_center = result.xyz.mean(axis=0)
 
-    scene_frames = render_orbit(
-        scene, ref_K, (H, W),
-        extrinsics=extrinsics,
-        scene_center=scene_center,
-        n_frames=n_orbit_frames,
-    )
+    scene_frames = render_from_cameras(scene, intrinsics, extrinsics, (H, W))
 
     scene_ply_path = Path("/tmp/scene.ply")
     write_splat_ply(scene, scene_ply_path)
@@ -891,11 +927,18 @@ def run_trellis_pipeline(
 
     combined = merge_gaussians(scene, placed)
 
-    combined_frames = render_orbit(
-        combined, ref_K, (H, W),
-        extrinsics=extrinsics,
-        scene_center=scene_center,
-        n_frames=n_orbit_frames,
+    combined_frames = render_from_cameras(combined, intrinsics, extrinsics, (H, W))
+
+    # Tight orbit around the placed asset — independent of scene scale, so the
+    # hydrant always fills the frame regardless of how far the training cameras are.
+    asset_close_frames = render_around_asset(
+        combined,
+        asset_center=np.array(center, dtype=np.float32),
+        asset_size=asset_size,
+        ref_intrinsic=intrinsics[0],
+        image_hw=(H, W),
+        world_up=world_up,
+        n_frames=8,
     )
 
     combined_ply_path = Path("/tmp/combined.ply")
@@ -912,6 +955,7 @@ def run_trellis_pipeline(
         "combined_ply": combined_ply_bytes,
         "scene_pngs": [to_png(f) for f in scene_frames],
         "combined_pngs": [to_png(f) for f in combined_frames],
+        "asset_close_pngs": [to_png(f) for f in asset_close_frames],
         "metrics": {
             "n_views": n_views,
             "n_points": result.voxel_count,
@@ -1028,15 +1072,27 @@ def trellis_insert(
     (out / "scene.ply").write_bytes(result["scene_ply"])
     (out / "combined.ply").write_bytes(result["combined_ply"])
 
-    scene_dir = out / "scene_orbit"
-    scene_dir.mkdir(exist_ok=True)
-    for i, png in enumerate(result["scene_pngs"]):
-        (scene_dir / f"frame_{i:02d}.png").write_bytes(png)
+    if asset_data.get("input_image_png"):
+        img_path = out / "trellis_input.png"
+        img_path.write_bytes(asset_data["input_image_png"])
+        print(f"  TRELLIS input    → {img_path.resolve()}")
 
+    def _write_frames(directory: Path, pngs: list[bytes]) -> None:
+        """Clear directory and write fresh frames — prevents stale files from old runs."""
+        import shutil
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir()
+        for i, png in enumerate(pngs):
+            (directory / f"frame_{i:02d}.png").write_bytes(png)
+
+    scene_dir = out / "scene_orbit"
     combined_dir = out / "combined_orbit"
-    combined_dir.mkdir(exist_ok=True)
-    for i, png in enumerate(result["combined_pngs"]):
-        (combined_dir / f"frame_{i:02d}.png").write_bytes(png)
+    asset_dir = out / "asset_close"
+
+    _write_frames(scene_dir, result["scene_pngs"])
+    _write_frames(combined_dir, result["combined_pngs"])
+    _write_frames(asset_dir, result["asset_close_pngs"])
 
     m = result["metrics"]
     print(
@@ -1054,4 +1110,5 @@ def trellis_insert(
         f"  combined.ply     → {(out / 'combined.ply').resolve()}\n"
         f"  scene_orbit/     → {scene_dir.resolve()} ({len(result['scene_pngs'])} frames)\n"
         f"  combined_orbit/  → {combined_dir.resolve()} ({len(result['combined_pngs'])} frames)\n"
+        f"  asset_close/     → {asset_dir.resolve()} ({len(result['asset_close_pngs'])} frames)\n"
     )
