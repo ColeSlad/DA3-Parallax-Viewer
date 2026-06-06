@@ -202,8 +202,10 @@ def place_asset(
 
     Returns GaussianScene in scene world frame, ready for merge_gaussians().
     """
+    # TRELLIS canonical frame is Z-up (render_utils uses [0,0,1] as camera up;
+    # GLB export applies the Z→Y transform [[1,0,0],[0,0,-1],[0,1,0]]).
     if asset_up is None:
-        asset_up = np.array([0., 1., 0.], dtype=np.float32)
+        asset_up = np.array([0., 0., 1.], dtype=np.float32)
 
     means = asset.means.numpy().copy()   # (N, 3)
     quats = asset.quats.numpy().copy()   # (N, 4) [w,x,y,z]
@@ -219,7 +221,7 @@ def place_asset(
         extent = 1.0
     means /= extent  # positions now in approximately [-0.5, 0.5]^3
 
-    # 3. Rotate: TRELLIS Y-up → scene world_up
+    # 3. Rotate: TRELLIS Z-up → scene world_up
     # After this rotation means still have unit scale; only orientation changes.
     R = _rotation_from_vectors(asset_up, world_up)
     means = means @ R.T   # (R @ x.T).T = x @ R.T  (apply R to each row)
@@ -232,14 +234,18 @@ def place_asset(
     # Gaussian splat sizes scale the same way: add log(target_size / extent)
     scale_factor = target_size / extent
     log_scales = asset.log_scales + math.log(max(scale_factor, 1e-8))
-    # Hard ceiling: no single Gaussian wider than 10% of the target bounding box.
-    # Prevents large structural splats from rendering as a featureless blob.
-    max_log_scale = math.log(target_size * 0.10)
+    pre_clamp_max = log_scales.exp().max().item()
+    pre_clamp_p90 = log_scales.exp().quantile(0.90).item()
+    # Hard ceiling: no Gaussian wider than 4% of target bounding box.
+    # 10% was too loose — large overlapping splats smear into a featureless blob.
+    max_log_scale = math.log(target_size * 0.04)
     log_scales = log_scales.clamp(max=max_log_scale)
+    n_clamped = (log_scales == max_log_scale).any(dim=-1).sum().item()
     print(
         f"[place_asset] extent={extent:.4f}  scale_factor={scale_factor:.4f}  "
-        f"log_scale range [{log_scales.min():.2f}, {log_scales.max():.2f}]  "
-        f"linear scale range [{log_scales.exp().min():.4f}m, {log_scales.exp().max():.4f}m]"
+        f"pre-clamp max={pre_clamp_max:.4f}m  p90={pre_clamp_p90:.4f}m  "
+        f"clamp_at={target_size*0.04:.4f}m  n_clamped={n_clamped:,}  "
+        f"final range [{log_scales.exp().min():.4f}m, {log_scales.exp().max():.4f}m]"
     )
 
     # 5. Translate to target_center (optionally snapping base to surface)
@@ -249,9 +255,13 @@ def place_asset(
         xy_dist = np.sqrt((snap_xyz[:, 0] - cx) ** 2 + (snap_xyz[:, 1] - cy) ** 2)
         nearby = snap_xyz[xy_dist < snap_radius]
         if len(nearby) > 0:
-            surface_z = float(nearby[:, 2].max())
-            center[2] = surface_z + target_size / 2.0
-            print(f"[place_asset] surface snap: z={surface_z:.3f} → asset center z={center[2]:.3f}")
+            # Use the nearest (min-z) surface point so the asset sits IN FRONT of
+            # the scene geometry, not behind it. For forward-facing cameras z=depth,
+            # so min_z is the closest visible surface; the asset base rests there
+            # and the center is offset toward the camera by half the asset size.
+            surface_z = float(nearby[:, 2].min())
+            center[2] = surface_z - target_size / 2.0
+            print(f"[place_asset] surface snap: min_z={surface_z:.3f} → asset center z={center[2]:.3f}")
 
     means += center
 

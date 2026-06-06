@@ -30,6 +30,11 @@ WEIGHTS_DIR = "/weights"
 trellis_weights_volume = modal.Volume.from_name("trellis-weights", create_if_missing=True)
 TRELLIS_WEIGHTS_DIR = "/trellis-weights"
 
+# Persistent volume for pipeline outputs — survives local client disconnects.
+# Use `modal run inference/app.py::download_outputs` to retrieve after a detached run.
+outputs_volume = modal.Volume.from_name("da3-outputs", create_if_missing=True)
+OUTPUTS_DIR = "/da3-outputs"
+
 # ---------------------------------------------------------------------------
 # Container image
 #
@@ -155,6 +160,7 @@ trellis_image = (
         "plyfile",
         "numpy",
         "Pillow",
+        "sentencepiece",  # required by FLUX.1-schnell's T5 tokenizer
         "huggingface_hub",
     )
     .run_commands(
@@ -766,10 +772,10 @@ def splat_validate(
 
 @app.function(
     image=trellis_image,
-    gpu="L4",  # 24 GB; fits TRELLIS-large (~16 GB) + SDXL-Turbo (~4 GB) sequentially
+    gpu="A100",  # FLUX.1-schnell is ~22 GB bf16; L4 (22 GB) is too tight alongside TRELLIS (16 GB)
     volumes={TRELLIS_WEIGHTS_DIR: trellis_weights_volume},
     secrets=[modal.Secret.from_name("huggingface-token")],
-    timeout=1800,  # 30 min: first run downloads TRELLIS (~15 GB) + SDXL-Turbo weights
+    timeout=1800,  # 30 min: first run downloads TRELLIS (~15 GB) + FLUX weights
 )
 def generate_asset(
     prompt: str,
@@ -790,18 +796,20 @@ def generate_asset(
     """
     from inference.splat_trellis import generate_asset_gaussians, gaussianscene_to_dict
 
-    gs, input_image_png = generate_asset_gaussians(
+    gs, input_image_png, mesh_xyz, mesh_rgb = generate_asset_gaussians(
         prompt=prompt,
         image_bytes=image_bytes,
         seed=seed,
         weights_dir=TRELLIS_WEIGHTS_DIR,
     )
-    print(f"[generate_asset] {gs.n:,} gaussians — returning to caller")
+    print(f"[generate_asset] {gs.n:,} gaussians  mesh={'yes' if mesh_xyz is not None else 'no'} — returning to caller")
     return {
         **gaussianscene_to_dict(gs),
         "n_gaussians": gs.n,
         "prompt": prompt,
         "input_image_png": input_image_png,
+        "mesh_xyz": mesh_xyz,
+        "mesh_rgb": mesh_rgb,
     }
 
 
@@ -813,7 +821,7 @@ def generate_asset(
 @app.function(
     image=gsplat_image,
     gpu="L4",
-    volumes={WEIGHTS_DIR: weights_volume},
+    volumes={WEIGHTS_DIR: weights_volume, OUTPUTS_DIR: outputs_volume},
     secrets=[modal.Secret.from_name("huggingface-token")],
     timeout=3600,
 )
@@ -850,7 +858,7 @@ def run_trellis_pipeline(
 
     from depth_anything_3.api import DepthAnything3
     from inference.reconstruction import build_point_cloud
-    from inference.splat_fit import fit_gaussians, render_from_cameras, render_around_asset, write_splat_ply, _infer_world_up
+    from inference.splat_fit import fit_gaussians, render_from_cameras, render_around_asset, refit_asset_gaussians, write_splat_ply, _infer_world_up
     from inference.splat_insert import place_asset, merge_gaussians
     from inference.splat_trellis import dict_to_gaussianscene
 
@@ -913,6 +921,20 @@ def run_trellis_pipeline(
     center = tuple(float(v) for v in scene_center) if asset_center is None else asset_center
     asset_gs = dict_to_gaussianscene(asset_data)
 
+    # Re-fit: render the blurry TRELLIS Gaussians from 20 synthetic views, then
+    # re-optimise a fresh set of Gaussians (same positions, small init_scale=3mm)
+    # against those views. Produces tight, gsplat-quality Gaussians from the
+    # TRELLIS 3D structure without being limited by the VAE decoder's blur.
+    asset_gs = refit_asset_gaussians(
+        asset_gs,
+        mesh_xyz=asset_data.get("mesh_xyz"),
+        mesh_rgb=asset_data.get("mesh_rgb"),
+        n_views=20,
+        image_hw=(512, 512),
+        n_iters=2000,
+        init_scale=5e-3,
+    )
+
     placed = place_asset(
         asset=asset_gs,
         target_center=center,
@@ -929,11 +951,20 @@ def run_trellis_pipeline(
 
     combined_frames = render_from_cameras(combined, intrinsics, extrinsics, (H, W))
 
-    # Tight orbit around the placed asset — independent of scene scale, so the
-    # hydrant always fills the frame regardless of how far the training cameras are.
+    # Tight orbit around the placed asset. Use the actual Gaussian centroid rather
+    # than the pre-snap `center` tuple — snap shifts z inside place_asset but the
+    # caller's variable isn't updated, so center may have the wrong z.
+    placed_means_np = placed.means.numpy()
+    # Use bounding-box center, not mean: asymmetric objects (tall hydrant, wider base)
+    # bias the mean away from geometric center, cutting off the top in the orbit render.
+    actual_asset_center = (
+        (placed_means_np.max(axis=0) + placed_means_np.min(axis=0)) / 2.0
+    ).astype(np.float32)
+    print(f"[trellis_pipeline] actual asset bbox center: {actual_asset_center.tolist()}")
+    # Render asset ALONE for clean quality diagnostic (no scene bleed).
     asset_close_frames = render_around_asset(
-        combined,
-        asset_center=np.array(center, dtype=np.float32),
+        placed,
+        asset_center=actual_asset_center,
         asset_size=asset_size,
         ref_intrinsic=intrinsics[0],
         image_hw=(H, W),
@@ -950,23 +981,46 @@ def run_trellis_pipeline(
         Image.fromarray(arr).save(buf, format="PNG")
         return buf.getvalue()
 
+    scene_pngs        = [to_png(f) for f in scene_frames]
+    combined_pngs     = [to_png(f) for f in combined_frames]
+    asset_close_pngs  = [to_png(f) for f in asset_close_frames]
+    metrics = {
+        "n_views": n_views,
+        "n_points": result.voxel_count,
+        "n_scene_gaussians": scene.n,
+        "n_asset_gaussians": placed.n,
+        "n_combined_gaussians": combined.n,
+        "asset_center": center,
+        "asset_size": asset_size,
+        "world_up": world_up.tolist(),
+        "prompt": asset_data.get("prompt", ""),
+    }
+
+    # Persist all outputs to the outputs volume so they survive a local disconnect.
+    # Retrieve with:  modal run inference/app.py::download_outputs
+    import json
+    vol_out = Path(OUTPUTS_DIR) / "latest"
+    vol_out.mkdir(parents=True, exist_ok=True)
+    (vol_out / "scene.ply").write_bytes(scene_ply_bytes)
+    (vol_out / "combined.ply").write_bytes(combined_ply_bytes)
+    if asset_data.get("input_image_png"):
+        (vol_out / "trellis_input.png").write_bytes(asset_data["input_image_png"])
+    for subdir, pngs in [("scene_orbit", scene_pngs), ("combined_orbit", combined_pngs), ("asset_close", asset_close_pngs)]:
+        d = vol_out / subdir
+        d.mkdir(exist_ok=True)
+        for i, png in enumerate(pngs):
+            (d / f"frame_{i:02d}.png").write_bytes(png)
+    (vol_out / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    outputs_volume.commit()
+    print(f"[trellis_pipeline] outputs saved to volume → {vol_out}")
+
     return {
         "scene_ply": scene_ply_bytes,
         "combined_ply": combined_ply_bytes,
-        "scene_pngs": [to_png(f) for f in scene_frames],
-        "combined_pngs": [to_png(f) for f in combined_frames],
-        "asset_close_pngs": [to_png(f) for f in asset_close_frames],
-        "metrics": {
-            "n_views": n_views,
-            "n_points": result.voxel_count,
-            "n_scene_gaussians": scene.n,
-            "n_asset_gaussians": placed.n,
-            "n_combined_gaussians": combined.n,
-            "asset_center": center,
-            "asset_size": asset_size,
-            "world_up": world_up.tolist(),
-            "prompt": asset_data.get("prompt", ""),
-        },
+        "scene_pngs": scene_pngs,
+        "combined_pngs": combined_pngs,
+        "asset_close_pngs": asset_close_pngs,
+        "metrics": metrics,
     }
 
 
@@ -1111,4 +1165,75 @@ def trellis_insert(
         f"  scene_orbit/     → {scene_dir.resolve()} ({len(result['scene_pngs'])} frames)\n"
         f"  combined_orbit/  → {combined_dir.resolve()} ({len(result['combined_pngs'])} frames)\n"
         f"  asset_close/     → {asset_dir.resolve()} ({len(result['asset_close_pngs'])} frames)\n"
+    )
+
+
+@app.function(
+    image=gsplat_image,
+    volumes={OUTPUTS_DIR: outputs_volume},
+)
+def _read_outputs_from_volume() -> dict:
+    """Read the latest trellis_insert outputs from the outputs volume."""
+    import json as _json
+
+    vol_out = Path(OUTPUTS_DIR) / "latest"
+    if not vol_out.exists():
+        raise RuntimeError("No outputs found in volume — has trellis_insert completed yet?")
+
+    result: dict = {}
+    result["scene_ply"]    = (vol_out / "scene.ply").read_bytes()
+    result["combined_ply"] = (vol_out / "combined.ply").read_bytes()
+    result["metrics"]      = _json.loads((vol_out / "metrics.json").read_text())
+    img_path = vol_out / "trellis_input.png"
+    result["input_image_png"] = img_path.read_bytes() if img_path.exists() else None
+
+    for key, subdir in [
+        ("scene_pngs",       "scene_orbit"),
+        ("combined_pngs",    "combined_orbit"),
+        ("asset_close_pngs", "asset_close"),
+    ]:
+        d = vol_out / subdir
+        result[key] = [f.read_bytes() for f in sorted(d.iterdir())] if d.exists() else []
+
+    return result
+
+
+@app.local_entrypoint()
+def download_outputs(output_dir: str = "output/trellis"):
+    """
+    Download the latest trellis_insert outputs from the Modal outputs volume.
+    Use this after a detached run or if the connection dropped mid-transfer:
+
+        modal run --detach inference/app.py::trellis_insert --prompt "..." ...
+        modal run inference/app.py::download_outputs
+    """
+    import shutil
+
+    print("Downloading outputs from Modal volume ...")
+    result = _read_outputs_from_volume.remote()
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    (out / "scene.ply").write_bytes(result["scene_ply"])
+    (out / "combined.ply").write_bytes(result["combined_ply"])
+    if result.get("input_image_png"):
+        (out / "trellis_input.png").write_bytes(result["input_image_png"])
+
+    def _write_frames(directory: Path, pngs: list[bytes]) -> None:
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir()
+        for i, png in enumerate(pngs):
+            (directory / f"frame_{i:02d}.png").write_bytes(png)
+
+    _write_frames(out / "scene_orbit",    result["scene_pngs"])
+    _write_frames(out / "combined_orbit", result["combined_pngs"])
+    _write_frames(out / "asset_close",    result["asset_close_pngs"])
+
+    m = result["metrics"]
+    print(
+        f"\n=== Downloaded outputs ===\n"
+        f"  Prompt      : {m.get('prompt', '')!r}\n"
+        f"  Output dir  : {out.resolve()}\n"
     )

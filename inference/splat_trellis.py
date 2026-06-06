@@ -5,11 +5,11 @@ Text path:  prompt → SDXL-Turbo image → TRELLIS → GaussianScene
 Image path: image_bytes → TRELLIS → GaussianScene
 
 TRELLIS canonical frame (output convention):
-  Up axis   : +Y
+  Up axis   : +Z  (render_utils uses [0,0,1] as camera up; GLB export applies Z→Y)
   Handedness: right-handed
-  Scale     : positions in approximately [-0.5, 0.5]^3
+  Scale     : positions in AABB [-0.5, -0.5, -0.5] → [1.0, 1.0, 1.0] (extent 1.5)
   Quaternions: [w, x, y, z]  (3DGS convention, same as our GaussianScene)
-  _scaling  : log space (same as our log_scales)
+  _scaling  : PRE-SOFTPLUS space  (actual_scale = softplus(_scaling) + 9e-4, NOT exp)
   _opacity  : logit space (same as our logit_opacities)
 
 The returned GaussianScene is in this canonical frame.
@@ -38,38 +38,76 @@ def _extract_trellis_gaussians(gs) -> GaussianScene:
     """
     Convert a TRELLIS Gaussian object to GaussianScene.
 
-    TRELLIS follows 3DGS conventions:
-      _rotation : unnormalized [w,x,y,z] quaternion
-      _scaling  : log-space scales
-      _opacity  : logit-space opacity, shape (N, 1)
-      _features_dc: SH DC coefficients, shape (N, 1, 3)
+    TRELLIS Gaussian representation differences from standard 3DGS:
+      _rotation : unnormalized [w,x,y,z] quaternion  (same as 3DGS)
+      _scaling  : PRE-SOFTPLUS values  (3DGS uses log-space / exp; TRELLIS uses softplus)
+      _opacity  : logit-space opacity, shape (N, 1)  (same as 3DGS)
+      _features_dc: SH DC coefficients, shape (N, 1, 3)  (sh_degree=0, no _features_rest)
 
+    Scale conversion: actual_scale = softplus(_scaling) + 9e-4 (minimum_kernel_size)
     Color conversion: linear_rgb = SH_C0 * f_dc + 0.5  →  logit → raw_colors
-    (DC-only: view-independent average color, sufficient for compositing)
     """
     means = gs._xyz.detach().cpu().float()                             # (N, 3)
     quats = F.normalize(gs._rotation.detach(), dim=-1).cpu().float()  # (N, 4) [w,x,y,z]
-    log_scales = gs._scaling.detach().cpu().float()                    # (N, 3)
+    # TRELLIS uses softplus (not exp) for scaling activation; convert to log-space
+    # so GaussianScene / gsplat can use exp(log_scales) correctly.
+    scaling_raw = gs._scaling.detach().cpu().float()                   # (N, 3) pre-softplus
+    actual_scales = F.softplus(scaling_raw) + 9e-4                    # match TRELLIS get_scaling
+    print(
+        f"[trellis] raw _scaling: min={scaling_raw.min():.3f}  max={scaling_raw.max():.3f}  "
+        f"mean={scaling_raw.mean():.3f}  → actual_scale p50={actual_scales.median():.4f}  "
+        f"p90={actual_scales.quantile(0.90).item():.4f}  max={actual_scales.max():.4f} (canonical units)"
+    )
+    log_scales = torch.log(actual_scales.clamp(min=1e-8))             # (N, 3) log-space
     logit_opacities = gs._opacity.detach().cpu().float().squeeze(-1)  # (N,)
 
     f_dc = gs._features_dc.detach().cpu().float()[:, 0, :]            # (N, 3)
     color_01 = (SH_C0 * f_dc + 0.5).clamp(1e-3, 1 - 1e-3)
     raw_colors = torch.log(color_01 / (1 - color_01))                 # (N, 3) logit
 
-    # Step 1: prune floaters — large-scale Gaussians and near-transparent splats
-    # cause light-streak artifacts. Cap at 90th-percentile max log-scale + opacity floor.
-    max_s = log_scales.max(dim=-1).values          # (N,) per-splat max log-scale
     opacity = torch.sigmoid(logit_opacities)        # (N,) in [0, 1]
+
+    # Step 0: remove near-pure-white Gaussians.
+    # TRELLIS's preprocess_image=True removes the background but leaves edge Gaussians
+    # that picked up the white background colour. These contaminate the object colour.
+    # Threshold: all three channels > 0.82 → near-white regardless of hue.
+    not_white = ~(color_01 > 0.82).all(dim=-1)
+    n_white = int((~not_white).sum())
+    if n_white:
+        means = means[not_white]; quats = quats[not_white]
+        log_scales = log_scales[not_white]; logit_opacities = logit_opacities[not_white]
+        raw_colors = raw_colors[not_white]; color_01 = color_01[not_white]
+        opacity = opacity[not_white]
+        print(f"[trellis] white filter: removed {n_white:,} near-white Gaussians")
+
+    # Step 1: centroid-based floater rejection.
+    # Derive the "core" region from high-opacity Gaussians so stray background
+    # splats (grids, golden streaks) that TRELLIS generates don't corrupt the radius.
+    hi_op_mask = opacity > 0.3
+    core_means = means[hi_op_mask] if hi_op_mask.sum() > 100 else means
+    core_centroid = core_means.mean(dim=0)
+    core_extent = float((core_means.max(dim=0).values - core_means.min(dim=0).values).max())
+    dist = (means - core_centroid).norm(dim=-1)
+    in_core = dist < core_extent * 1.1  # discard Gaussians outside 110% of core radius
+    print(
+        f"[trellis] floater filter: core_extent={core_extent:.4f}  "
+        f"removed {(~in_core).sum():,} of {means.shape[0]:,} Gaussians outside core"
+    )
+
+    means = means[in_core]; quats = quats[in_core]
+    log_scales = log_scales[in_core]; logit_opacities = logit_opacities[in_core]
+    raw_colors = raw_colors[in_core]; opacity = opacity[in_core]
+
+    # Step 2: prune remaining floaters by scale + opacity floor.
+    max_s = log_scales.max(dim=-1).values          # (N,) per-splat max log-scale
     scale_cap = torch.quantile(max_s, 0.90)
-    keep = (max_s <= scale_cap) & (opacity > 0.05)
+    keep = (max_s <= scale_cap) & (opacity > 0.10)
 
     means = means[keep]; quats = quats[keep]
     log_scales = log_scales[keep]; logit_opacities = logit_opacities[keep]
     raw_colors = raw_colors[keep]; opacity = opacity[keep]
 
-    # Step 2: subsample to at most MAX_GAUSSIANS keeping the most opaque splats.
-    # Opacity-sorted is safe here because place_asset hard-clamps scale, so
-    # selecting high-opacity Gaussians no longer risks keeping giant blobs.
+    # Step 3: subsample to at most MAX_GAUSSIANS keeping the most opaque splats.
     MAX_GAUSSIANS = 30_000
     n_after_filter = means.shape[0]
     if n_after_filter > MAX_GAUSSIANS:
@@ -81,7 +119,7 @@ def _extract_trellis_gaussians(gs) -> GaussianScene:
     n_final = means.shape[0]
     print(
         f"[trellis] {gs._xyz.shape[0]:,} raw  "
-        f"→ {n_after_filter:,} after filter (scale_cap={scale_cap.item():.3f})  "
+        f"→ {n_after_filter:,} after scale/opacity filter (scale_cap={scale_cap.item():.3f})  "
         f"→ {n_final:,} after subsample"
     )
 
@@ -124,27 +162,98 @@ def dict_to_gaussianscene(d: dict) -> GaussianScene:
 # Main generation function (runs inside Modal TRELLIS container)
 # ---------------------------------------------------------------------------
 
+def _sample_mesh_points(
+    mesh,
+    gs_means: np.ndarray,
+    gs_colors: np.ndarray,
+    n_samples: int = 30_000,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """
+    Sample surface points from a TRELLIS mesh and assign per-point colors.
+
+    Colors are sourced in priority order:
+      1. vertex_attrs['rgb']  — direct per-vertex RGB from TRELLIS decoder
+      2. vertex_attrs['shs']  — SH DC term converted to RGB
+      3. KNN from TRELLIS Gaussians — always available fallback
+
+    Returns (xyz, rgb) float32 arrays or (None, None) on any failure.
+    """
+    try:
+        import trimesh as _trimesh  # noqa: PLC0415
+        from scipy.spatial import cKDTree  # noqa: PLC0415
+
+        verts = getattr(mesh, 'vertices', None) or getattr(mesh, 'verts', None)
+        faces = getattr(mesh, 'faces', None)
+        if verts is None or faces is None:
+            print("[mesh_sample] no vertices/faces on mesh — skipping")
+            return None, None
+
+        to_np = lambda t: t.detach().cpu().float().numpy() if hasattr(t, 'detach') else np.asarray(t, dtype=np.float32)
+        verts_np = to_np(verts)
+        faces_np = np.asarray(faces.detach().cpu().numpy() if hasattr(faces, 'detach') else faces, dtype=np.int32)
+
+        tm = _trimesh.Trimesh(vertices=verts_np, faces=faces_np, process=False)
+        pts, face_idx = _trimesh.sample.sample_surface(tm, n_samples)
+        pts = pts.astype(np.float32)
+
+        # Attempt to get per-vertex colors
+        vertex_colors = None
+        color_src = None
+        attrs = getattr(mesh, 'vertex_attrs', None) or {}
+        if 'rgb' in attrs:
+            vertex_colors = to_np(attrs['rgb']).clip(0, 1)
+            color_src = "vertex_attrs['rgb']"
+        elif 'shs' in attrs:
+            SH_C0 = 0.28209479177387814
+            vertex_colors = (to_np(attrs['shs'])[:, :3] * SH_C0 + 0.5).clip(0, 1)
+            color_src = "vertex_attrs['shs'] DC"
+
+        if vertex_colors is not None:
+            bary = _trimesh.triangles.points_to_barycentric(
+                triangles=verts_np[faces_np[face_idx]],
+                points=pts,
+            ).astype(np.float32)
+            face_vcolors = vertex_colors[faces_np[face_idx]]  # (N, 3, 3)
+            colors = np.einsum('ni,nij->nj', bary, face_vcolors).clip(0, 1).astype(np.float32)
+        else:
+            _, knn_idx = cKDTree(gs_means).query(pts, k=1)
+            colors = gs_colors[knn_idx].astype(np.float32)
+            color_src = "KNN from TRELLIS Gaussians"
+
+        print(f"[mesh_sample] {n_samples:,} surface pts  colors={color_src}")
+        return pts, colors
+
+    except Exception as exc:
+        print(f"[mesh_sample] failed ({exc}) — will use blurry Gaussian training views")
+        return None, None
+
+
 def generate_asset_gaussians(
     prompt: str,
     image_bytes: bytes | None = None,
     seed: int = 42,
     weights_dir: str = "/trellis-weights",
-) -> tuple["GaussianScene", bytes]:
+) -> tuple["GaussianScene", bytes, np.ndarray | None, np.ndarray | None]:
     """
     Generate 3D Gaussians from a text prompt or image using TRELLIS.
 
-    Text path:  SDXL-Turbo generates an image → TRELLIS converts to 3D.
+    Text path:  SDXL-Turbo/FLUX generates an image → TRELLIS converts to 3D.
     Image path: TRELLIS converts the provided image directly.
 
-    Returns (GaussianScene, image_png_bytes) — the GaussianScene in TRELLIS
-    canonical frame (Y-up, ~[-0.5,0.5]^3) and the PNG bytes of the image that
-    was fed into TRELLIS (for inspection / diagnostics).
-    The caller must run splat_insert.place_asset() to bring into scene frame.
+    Returns (GaussianScene, image_png_bytes, mesh_xyz, mesh_rgb).
+    mesh_xyz/mesh_rgb are surface-sampled points from the TRELLIS mesh decoder
+    (30k points, float32). Used by refit_asset_gaussians to render sharp training
+    views instead of blurry Gaussian-rendered views.
+    Returns None for mesh arrays if the mesh decoder fails.
 
+    The caller must run splat_insert.place_asset() to bring into scene frame.
     Weights are cached in `weights_dir` (Modal Volume mount point).
     """
     import os
+    import warnings
     os.environ.setdefault("HF_HOME", weights_dir)
+    # xformers uses the deprecated torch.library.impl_abstract API; suppress until xformers updates.
+    warnings.filterwarnings("ignore", category=FutureWarning, module="xformers")
 
     if image_bytes is not None:
         print(f"[trellis] image-to-3D  ({len(image_bytes) // 1024} KB input)")
@@ -172,9 +281,10 @@ def generate_asset_gaussians(
     outputs = pipeline.run(
         image,
         seed=seed,
-        # Gaussian output only — skips the mesh decoder (no nvdiffrast needed)
-        formats=["gaussian"],
-        preprocess_image=True,  # TRELLIS handles resize + background removal
+        formats=["gaussian", "mesh"],   # mesh gives sharp surface for refit training views
+        preprocess_image=True,          # TRELLIS handles resize + background removal
+        sparse_structure_sampler_params={"steps": 25, "cfg_strength": 7.5},
+        slat_sampler_params={"steps": 25, "cfg_strength": 3.0},
     )
     gs = outputs["gaussian"][0]
     n = gs._xyz.shape[0]
@@ -182,11 +292,25 @@ def generate_asset_gaussians(
 
     result = _extract_trellis_gaussians(gs)
 
+    # Sample mesh surface for sharp refit training views
+    mesh_xyz, mesh_rgb = None, None
+    mesh_out = outputs.get("mesh", [])
+    print(f"[trellis] mesh output: {type(mesh_out)}  len={len(mesh_out) if hasattr(mesh_out, '__len__') else 'N/A'}")
+    if mesh_out:
+        mesh_obj = mesh_out[0]
+        print(f"[trellis] mesh[0] type={type(mesh_obj).__name__}  attrs={[a for a in dir(mesh_obj) if not a.startswith('_')][:15]}")
+        gs_colors = torch.sigmoid(result.raw_colors).numpy()
+        mesh_xyz, mesh_rgb = _sample_mesh_points(
+            mesh_obj,
+            gs_means=result.means.numpy(),
+            gs_colors=gs_colors,
+        )
+
     # Free GPU memory before returning
     del pipeline, gs, outputs
     torch.cuda.empty_cache()
 
-    return result, input_image_bytes
+    return result, input_image_bytes, mesh_xyz, mesh_rgb
 
 
 # ---------------------------------------------------------------------------
@@ -195,30 +319,36 @@ def generate_asset_gaussians(
 
 def _text_to_image(prompt: str, cache_dir: str) -> Image.Image:
     """
-    Generate a single 512x512 RGB image from a text prompt using SDXL-Turbo.
+    Generate a 1024x1024 RGB image from a text prompt using FLUX.1-schnell.
+    FLUX.1-schnell is a distilled flow-matching model: 4 steps, no CFG, bfloat16.
+    Substantially higher quality than SDXL-Turbo at the same step count.
     Frees GPU memory after generation so TRELLIS can load cleanly.
     """
-    from diffusers import AutoPipelineForText2Image  # noqa: PLC0415
+    from diffusers import FluxPipeline  # noqa: PLC0415
 
     print(f"[trellis] generating image for prompt: {prompt!r}")
-    pipe = AutoPipelineForText2Image.from_pretrained(
-        "stabilityai/sdxl-turbo",
-        torch_dtype=torch.float16,
-        variant="fp16",
+    pipe = FluxPipeline.from_pretrained(
+        "black-forest-labs/FLUX.1-schnell",
+        torch_dtype=torch.bfloat16,
         cache_dir=cache_dir,
     )
     pipe = pipe.to("cuda")
 
     # Wrap the prompt to bias toward a clean single-object render; TRELLIS
     # background-removes the result, so a neutral-bg product-photo style helps.
-    wrapped = f"{prompt}, single object, white background, product photo, centered"
+    # FLUX follows natural language well so a descriptive style works better than
+    # comma-separated tags.
+    wrapped = (
+        f"{prompt}, single object on a pure white background, "
+        "product photography, studio lighting, centered, no shadows"
+    )
     with torch.inference_mode():
         result = pipe(
             prompt=wrapped,
-            num_inference_steps=4,  # turbo: 1–4 steps sufficient
-            guidance_scale=0.0,     # distilled model; CFG not needed
-            width=512,
-            height=512,
+            num_inference_steps=4,   # schnell: distilled, 4 steps sufficient
+            guidance_scale=0.0,      # distilled model; CFG not needed
+            width=1024,
+            height=1024,
         )
 
     image = result.images[0]
