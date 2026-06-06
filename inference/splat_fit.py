@@ -277,14 +277,8 @@ def render_orbit_with_cameras(
     device: str = "cuda",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Render a synthetic orbit around the scene and return the camera matrices.
-
-    Returns:
-        images     (N, H, W, 3) uint8
-        extrinsics (N, 3, 4)  world-to-cam [R|t]
-        intrinsics (N, 3, 3)
-
-    Intended for generating multi-view training data for refit_asset_gaussians.
+    Render a synthetic orbit and return (images, extrinsics, intrinsics).
+    Used to generate multi-view training data for refit_asset_gaussians.
     """
     from gsplat import rasterization
 
@@ -295,9 +289,8 @@ def render_orbit_with_cameras(
     radius = max(extent * 2.5, 0.1)
 
     if world_up is None:
-        world_up = np.array([0., 0., 1.], dtype=np.float32)  # TRELLIS canonical Z-up
+        world_up = np.array([0., 0., 1.], dtype=np.float32)
 
-    # Focal length: object fills ~60% of frame width at this orbit radius
     f = (W / 2.0) / math.atan2(extent * 0.6, radius)
     K = np.array([[f, 0, W / 2.0], [0, f, H / 2.0], [0, 0, 1]], dtype=np.float32)
     K_t = torch.from_numpy(K).unsqueeze(0).to(device)
@@ -334,7 +327,7 @@ def render_orbit_with_cameras(
 
         R = np.stack([right, -up, fwd], axis=0)
         t = -R @ cam_pos
-        ext = np.concatenate([R, t[:, None]], axis=1).astype(np.float32)  # (3, 4)
+        ext = np.concatenate([R, t[:, None]], axis=1).astype(np.float32)
         vm = np.eye(4, dtype=np.float32); vm[:3, :] = ext
         vm_t = torch.from_numpy(vm).unsqueeze(0).to(device)
 
@@ -365,39 +358,27 @@ def refit_asset_gaussians(
     device: str = "cuda",
 ) -> GaussianScene:
     """
-    Re-fit tight gsplat Gaussians to match a TRELLIS asset's multi-view appearance.
+    Re-fit tight gsplat Gaussians against multi-view renders of the TRELLIS asset.
 
-    Training view source (in priority order):
-      1. mesh_xyz / mesh_rgb — 30k surface points from TRELLIS mesh decoder.
-         Rendered as tiny (4mm) Gaussians → crisp, sharp training images.
-         Mesh Gaussians are also used as the optimization initialization, giving
-         better surface coverage than TRELLIS's VAE Gaussian positions.
-      2. Isotropic TRELLIS Gaussians (fallback when mesh is unavailable).
-         Forced spherical for view consistency; blurry but always available.
+    Uses mesh surface points (if available) as both training view source and
+    initialization — gives sharper results than the raw TRELLIS VAE Gaussians.
+    Falls back to isotropic TRELLIS Gaussians when mesh is unavailable.
     """
     if mesh_xyz is not None and mesh_rgb is not None:
-        # Build a crisp point-cloud GaussianScene from mesh surface samples.
-        # Scale=4mm: small enough for sharp renders, large enough to cover 30k-point gaps.
-        # Opacity logit=4.0 → ~0.98: fully opaque so training views are clean silhouettes.
         N_mesh = len(mesh_xyz)
         rgb_clipped = np.clip(mesh_rgb, 1e-3, 1 - 1e-3).astype(np.float32)
-        colors_logit = np.log(rgb_clipped / (1 - rgb_clipped))
         render_scene = GaussianScene(
             means=torch.from_numpy(mesh_xyz),
             quats=torch.cat([torch.ones(N_mesh, 1), torch.zeros(N_mesh, 3)], dim=1),
             log_scales=torch.full((N_mesh, 3), math.log(4e-3)),
             logit_opacities=torch.full((N_mesh,), 4.0),
-            raw_colors=torch.from_numpy(colors_logit),
+            raw_colors=torch.from_numpy(np.log(rgb_clipped / (1 - rgb_clipped))),
         )
         init_xyz = mesh_xyz
         init_rgb = (np.clip(mesh_rgb, 0, 1) * 255).astype(np.uint8)
-        print(f"[refit] mesh-based training views — {N_mesh:,} surface pts, scale=4mm")
+        print(f"[refit] mesh-based training views — {N_mesh:,} surface pts")
     else:
-        # Fallback: isotropic TRELLIS Gaussians.
-        # 50th-pct scale; cap at 6mm so training views are as sharp as possible.
-        # (15mm was too blurry — optimizer learned large transparent Gaussians to match.)
-        iso_log = float(torch.quantile(asset.log_scales.flatten(), 0.50).item())
-        iso_log = min(iso_log, math.log(0.006))
+        iso_log = min(float(torch.quantile(asset.log_scales.flatten(), 0.50).item()), math.log(0.006))
         render_scene = GaussianScene(
             means=asset.means,
             quats=asset.quats,
@@ -405,48 +386,23 @@ def refit_asset_gaussians(
             logit_opacities=asset.logit_opacities,
             raw_colors=asset.raw_colors,
         )
-        # Bottom augmentation: TRELLIS under-samples the base skirt; duplicate bottom-third.
-        means_np = asset.means.numpy()
-        colors_np = (asset.colors().numpy() * 255).clip(0, 255).astype(np.uint8)
-        z_vals = means_np[:, 2]
-        bbox_z_range = float(z_vals.max() - z_vals.min())
-        z_bottom_thresh = float(z_vals.min()) + bbox_z_range * 0.35
-        bottom_mask = z_vals < z_bottom_thresh
-        n_bottom = int(bottom_mask.sum())
-        if n_bottom > 20:
-            rng = np.random.default_rng(0)
-            jitter = rng.normal(0, bbox_z_range * 0.015, (n_bottom, 3)).astype(np.float32)
-            init_xyz = np.concatenate([means_np, means_np[bottom_mask] + jitter], axis=0)
-            init_rgb = np.concatenate([colors_np, colors_np[bottom_mask]], axis=0)
-            print(f"[refit] isotropic fallback — bottom augment +{n_bottom:,} pts  scale={math.exp(iso_log)*1000:.1f}mm")
-        else:
-            init_xyz = means_np
-            init_rgb = colors_np
-            print(f"[refit] isotropic fallback  scale={math.exp(iso_log)*1000:.1f}mm")
+        init_xyz = asset.means.numpy()
+        init_rgb = (asset.colors().numpy() * 255).clip(0, 255).astype(np.uint8)
+        print(f"[refit] isotropic fallback  scale={math.exp(iso_log)*1000:.1f}mm")
 
-    print(f"[refit] rendering {n_views} side + 32 pole orbit views …")
-    imgs, exts, Ks = render_orbit_with_cameras(
-        render_scene, image_hw=image_hw, n_frames=n_views, device=device,
-    )
+    print(f"[refit] rendering {n_views} side + 32 pole orbit views ...")
+    imgs, exts, Ks = render_orbit_with_cameras(render_scene, image_hw=image_hw, n_frames=n_views, device=device)
     for elev in (60.0, 75.0, -55.0, -75.0):
-        imgs_e, exts_e, Ks_e = render_orbit_with_cameras(
-            render_scene, image_hw=image_hw, n_frames=8, elevation_deg=elev, device=device,
-        )
+        imgs_e, exts_e, Ks_e = render_orbit_with_cameras(render_scene, image_hw=image_hw, n_frames=8, elevation_deg=elev, device=device)
         imgs = np.concatenate([imgs, imgs_e], axis=0)
         exts = np.concatenate([exts, exts_e], axis=0)
         Ks   = np.concatenate([Ks,   Ks_e],  axis=0)
 
-    print(f"[refit] fitting {len(init_xyz):,} Gaussians against {len(imgs)} views …")
+    print(f"[refit] fitting {len(init_xyz):,} Gaussians against {len(imgs)} views ...")
     result = fit_gaussians(
-        xyz=init_xyz,
-        rgb=init_rgb,
-        images=imgs,
-        intrinsics=Ks,
-        extrinsics=exts,
-        n_iters=n_iters,
-        init_scale=init_scale,
-        scale_reg=0.05,
-        scale_cap=init_scale * 5,  # tighter than default *10; keeps Gaussians small
+        xyz=init_xyz, rgb=init_rgb, images=imgs, intrinsics=Ks, extrinsics=exts,
+        n_iters=n_iters, init_scale=init_scale,
+        scale_reg=0.05, scale_cap=init_scale * 5,
         device=device,
     )
     print(f"[refit] done — {result.n:,} Gaussians")

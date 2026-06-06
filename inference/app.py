@@ -790,14 +790,8 @@ def generate_asset(
     """
     Generate 3D Gaussians from a text prompt (or image) using TRELLIS.
 
-    Text path:  SDXL-Turbo generates an image, then TRELLIS converts to 3D.
-    Image path: TRELLIS converts the provided image bytes directly.
-
-    Returns a dict of numpy arrays representing the GaussianScene in TRELLIS
-    canonical frame (Y-up, ~[-0.5,0.5]^3). The caller must run
-    run_trellis_pipeline() (or equivalent) to place it in the scene world frame.
-
-    GPU note: L4 (24 GB) should be sufficient. If OOM, change gpu="A100".
+    Returns a dict of numpy arrays (GaussianScene) in TRELLIS canonical frame.
+    Call run_trellis_pipeline() to place them in the scene world frame.
     """
     from inference.splat_trellis import generate_asset_gaussians, gaussianscene_to_dict
 
@@ -807,7 +801,7 @@ def generate_asset(
         seed=seed,
         weights_dir=TRELLIS_WEIGHTS_DIR,
     )
-    print(f"[generate_asset] {gs.n:,} gaussians  mesh={'yes' if mesh_xyz is not None else 'no'} — returning to caller")
+    print(f"[generate_asset] {gs.n:,} gaussians — returning to caller")
     return {
         **gaussianscene_to_dict(gs),
         "n_gaussians": gs.n,
@@ -926,10 +920,6 @@ def run_trellis_pipeline(
     center = tuple(float(v) for v in scene_center) if asset_center is None else asset_center
     asset_gs = dict_to_gaussianscene(asset_data)
 
-    # Re-fit: render the blurry TRELLIS Gaussians from 20 synthetic views, then
-    # re-optimise a fresh set of Gaussians (same positions, small init_scale=3mm)
-    # against those views. Produces tight, gsplat-quality Gaussians from the
-    # TRELLIS 3D structure without being limited by the VAE decoder's blur.
     asset_gs = refit_asset_gaussians(
         asset_gs,
         mesh_xyz=asset_data.get("mesh_xyz"),
