@@ -81,14 +81,14 @@ def _extract_trellis_gaussians(gs) -> GaussianScene:
         print(f"[trellis] white filter: removed {n_white:,} near-white Gaussians")
 
     # Step 1: centroid-based floater rejection.
-    # Derive the "core" region from high-opacity Gaussians so stray background
-    # splats (grids, golden streaks) that TRELLIS generates don't corrupt the radius.
+    # Use a generous 3× multiplier so extended features (wings, tails, antennae) are
+    # kept; only truly distant background grid / streak artifacts are cut.
     hi_op_mask = opacity > 0.3
     core_means = means[hi_op_mask] if hi_op_mask.sum() > 100 else means
     core_centroid = core_means.mean(dim=0)
     core_extent = float((core_means.max(dim=0).values - core_means.min(dim=0).values).max())
     dist = (means - core_centroid).norm(dim=-1)
-    in_core = dist < core_extent * 1.1  # discard Gaussians outside 110% of core radius
+    in_core = dist < core_extent * 3.0
     print(
         f"[trellis] floater filter: core_extent={core_extent:.4f}  "
         f"removed {(~in_core).sum():,} of {means.shape[0]:,} Gaussians outside core"
@@ -98,28 +98,31 @@ def _extract_trellis_gaussians(gs) -> GaussianScene:
     log_scales = log_scales[in_core]; logit_opacities = logit_opacities[in_core]
     raw_colors = raw_colors[in_core]; opacity = opacity[in_core]
 
-    # Step 2: prune remaining floaters by scale + opacity floor.
-    max_s = log_scales.max(dim=-1).values          # (N,) per-splat max log-scale
-    scale_cap = torch.quantile(max_s, 0.90)
-    keep = (max_s <= scale_cap) & (opacity > 0.10)
+    # Step 2: prune near-invisible Gaussians only.
+    # Do NOT cap by scale — large Gaussians are interior fill and removing them
+    # creates a hollow shell. The spatial filter above handles distant floaters.
+    keep = opacity > 0.02
 
     means = means[keep]; quats = quats[keep]
     log_scales = log_scales[keep]; logit_opacities = logit_opacities[keep]
     raw_colors = raw_colors[keep]; opacity = opacity[keep]
 
-    # Step 3: subsample to at most MAX_GAUSSIANS keeping the most opaque splats.
-    MAX_GAUSSIANS = 30_000
+    # Step 3: subsample to at most MAX_GAUSSIANS using random sampling.
+    # Top-opacity subsampling preferentially keeps surface splats and discards
+    # interior fill Gaussians, producing a hollow appearance. Random sampling
+    # preserves the full density distribution TRELLIS learned.
+    MAX_GAUSSIANS = 100_000
     n_after_filter = means.shape[0]
     if n_after_filter > MAX_GAUSSIANS:
-        topk_idx = torch.topk(opacity, MAX_GAUSSIANS).indices
-        means = means[topk_idx]; quats = quats[topk_idx]
-        log_scales = log_scales[topk_idx]; logit_opacities = logit_opacities[topk_idx]
-        raw_colors = raw_colors[topk_idx]
+        perm = torch.randperm(n_after_filter)[:MAX_GAUSSIANS]
+        means = means[perm]; quats = quats[perm]
+        log_scales = log_scales[perm]; logit_opacities = logit_opacities[perm]
+        raw_colors = raw_colors[perm]
 
     n_final = means.shape[0]
     print(
         f"[trellis] {gs._xyz.shape[0]:,} raw  "
-        f"→ {n_after_filter:,} after scale/opacity filter (scale_cap={scale_cap.item():.3f})  "
+        f"→ {n_after_filter:,} after opacity filter  "
         f"→ {n_final:,} after subsample"
     )
 
@@ -249,9 +252,7 @@ def generate_asset_gaussians(
     The caller must run splat_insert.place_asset() to bring into scene frame.
     Weights are cached in `weights_dir` (Modal Volume mount point).
     """
-    import os
     import warnings
-    os.environ.setdefault("HF_HOME", weights_dir)
     # xformers uses the deprecated torch.library.impl_abstract API; suppress until xformers updates.
     warnings.filterwarnings("ignore", category=FutureWarning, module="xformers")
 

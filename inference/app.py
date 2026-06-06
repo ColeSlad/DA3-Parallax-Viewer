@@ -193,6 +193,11 @@ trellis_image = (
         # 'xformers' or 'flash_attn' — sdpa is not supported there.
         # xformers is installed above; this env var selects it.
         "SPARSE_ATTN_BACKEND": "xformers",
+        # Point HF cache at the persistent volume mount. Setting this in the image
+        # env (rather than os.environ at runtime) ensures it is resolved before any
+        # HF library code runs — even if a TRELLIS module imports transformers/diffusers
+        # at module level before our function body executes.
+        "HF_HOME": TRELLIS_WEIGHTS_DIR,
     })
     .add_local_python_source("inference")
 )
