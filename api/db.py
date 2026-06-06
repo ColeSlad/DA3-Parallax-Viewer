@@ -31,6 +31,24 @@ async def insert_job(pool, job_id: uuid.UUID, input_keys: list[str]) -> None:
     )
 
 
+async def insert_insertion_job(
+    pool,
+    job_id: uuid.UUID,
+    parent_id: uuid.UUID,
+    params: dict,
+) -> None:
+    import json
+    await pool.execute(
+        """
+        INSERT INTO jobs (id, kind, parent_id, params, input_keys)
+        VALUES ($1, 'insertion', $2, $3::jsonb, '{}'::text[])
+        """,
+        job_id,
+        parent_id,
+        json.dumps(params),
+    )
+
+
 async def get_job(pool, job_id: uuid.UUID) -> dict[str, Any] | None:
     row = await pool.fetchrow("SELECT * FROM jobs WHERE id = $1", job_id)
     return dict(row) if row else None
