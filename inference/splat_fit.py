@@ -534,8 +534,53 @@ def render_around_asset(
 
 
 # ---------------------------------------------------------------------------
-# PLY export (3DGS / SuperSplat format)
+# PLY import/export (3DGS / SuperSplat format)
 # ---------------------------------------------------------------------------
+
+def read_splat_ply(data: bytes) -> GaussianScene:
+    """
+    Deserialize a 3DGS PLY written by write_splat_ply back into a GaussianScene.
+
+    Parses the 17-float-per-vertex binary format directly; no external deps.
+    Reverses the SH-DC ↔ logit-color transform applied by write_splat_ply.
+    """
+    import io as _io
+
+    f = _io.BytesIO(data)
+    n_vertices = 0
+    while True:
+        line = f.readline().decode("ascii").strip()
+        if line.startswith("element vertex"):
+            n_vertices = int(line.split()[-1])
+        if line == "end_header":
+            break
+
+    dtype = np.dtype([
+        ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+        ("nx", "<f4"), ("ny", "<f4"), ("nz", "<f4"),
+        ("f_dc_0", "<f4"), ("f_dc_1", "<f4"), ("f_dc_2", "<f4"),
+        ("opacity", "<f4"),
+        ("scale_0", "<f4"), ("scale_1", "<f4"), ("scale_2", "<f4"),
+        ("rot_0", "<f4"), ("rot_1", "<f4"), ("rot_2", "<f4"), ("rot_3", "<f4"),
+    ])
+    arr = np.frombuffer(f.read(n_vertices * dtype.itemsize), dtype=dtype)
+
+    means = np.stack([arr["x"], arr["y"], arr["z"]], axis=1).astype(np.float32)
+    f_dc = np.stack([arr["f_dc_0"], arr["f_dc_1"], arr["f_dc_2"]], axis=1).astype(np.float32)
+    # Reverse: f_dc = (colors_01 - 0.5) / SH_C0  →  colors_01 = f_dc * SH_C0 + 0.5
+    colors_01 = np.clip(f_dc * SH_C0 + 0.5, 1e-3, 1 - 1e-3)
+    raw_colors = np.log(colors_01 / (1 - colors_01)).astype(np.float32)
+    log_scales = np.stack([arr["scale_0"], arr["scale_1"], arr["scale_2"]], axis=1).astype(np.float32)
+    quats = np.stack([arr["rot_0"], arr["rot_1"], arr["rot_2"], arr["rot_3"]], axis=1).astype(np.float32)
+
+    return GaussianScene(
+        means=torch.from_numpy(means),
+        quats=torch.from_numpy(quats),
+        log_scales=torch.from_numpy(log_scales),
+        logit_opacities=torch.from_numpy(arr["opacity"].astype(np.float32)),
+        raw_colors=torch.from_numpy(raw_colors),
+    )
+
 
 def write_splat_ply(scene: GaussianScene, path: str | Path) -> None:
     """
