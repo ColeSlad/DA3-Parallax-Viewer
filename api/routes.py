@@ -1,8 +1,11 @@
 """
-FastAPI application: POST /api/reconstructions and GET /api/reconstructions/{job_id}.
+FastAPI routes.
 
-This module is imported inside the Modal web_app function body, so it runs only
-in the API container. Heavy Modal/GPU imports are never touched here.
+Endpoints:
+  POST /api/reconstructions                       — upload photos, kick off DA3+gsplat job
+  GET  /api/reconstructions/{job_id}              — poll; result has splat_url + pointcloud_url
+  POST /api/scenes/{scene_job_id}/insertions      — kick off TRELLIS insertion job
+  GET  /api/insertions/{job_id}                   — poll; result has combined_splat_url
 """
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, field_validator
 
 from api import db, r2
 
@@ -51,7 +55,7 @@ fastapi_app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Routes
+# Reconstruction endpoints
 # ---------------------------------------------------------------------------
 
 
@@ -106,8 +110,7 @@ async def create_reconstruction(
     pool = request.app.state.pool
     await db.insert_job(pool, job_id, input_keys)
 
-    # Spawn GPU worker fire-and-forget (import lazily to avoid circular imports
-    # at module load time)
+    # Spawn GPU worker fire-and-forget
     from api.main import worker
     await worker.spawn.aio(str(job_id))
 
@@ -129,9 +132,13 @@ async def get_reconstruction(job_id: str, request: Request):
     result: dict[str, Any] | None = None
     if row["status"] == "succeeded" and row["result_key"]:
         r2_client = request.app.state.r2
-        ply_url = await asyncio.to_thread(r2.presign_get, r2_client, row["result_key"])
+        pointcloud_url = await asyncio.to_thread(r2.presign_get, r2_client, row["result_key"])
+        splat_url = None
+        if row.get("splat_key"):
+            splat_url = await asyncio.to_thread(r2.presign_get, r2_client, row["splat_key"])
         result = {
-            "ply_url": ply_url,
+            "pointcloud_url": pointcloud_url,
+            "splat_url": splat_url,
             "point_count": row["point_count"],
             "view_count": row["view_count"],
             "duration_ms": row["duration_ms"],
@@ -139,6 +146,104 @@ async def get_reconstruction(job_id: str, request: Request):
 
     return {
         "job_id": str(row["id"]),
+        "status": row["status"],
+        "created_at": row["created_at"].isoformat(),
+        "result": result,
+        "error": row["error"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Insertion endpoints
+# ---------------------------------------------------------------------------
+
+
+class InsertionRequest(BaseModel):
+    prompt: str
+    position: list[float]   # [x, y, z] world coordinates
+    size_m: float           # target bounding-box diameter in metres
+    orientation: str | None = None  # reserved; not used by placement yet
+
+    @field_validator("position")
+    @classmethod
+    def position_must_be_xyz(cls, v: list[float]) -> list[float]:
+        if len(v) != 3:
+            raise ValueError("position must have exactly 3 elements [x, y, z]")
+        return v
+
+    @field_validator("size_m")
+    @classmethod
+    def size_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("size_m must be positive")
+        return v
+
+
+@fastapi_app.post("/api/scenes/{scene_job_id}/insertions", status_code=202)
+async def create_insertion(
+    scene_job_id: str,
+    body: InsertionRequest,
+    request: Request,
+):
+    try:
+        scene_jid = uuid.UUID(scene_job_id)
+    except ValueError:
+        raise HTTPException(404, "Scene job not found")
+
+    pool = request.app.state.pool
+    scene_row = await db.get_job(pool, scene_jid)
+    if scene_row is None:
+        raise HTTPException(404, "Scene job not found")
+    if scene_row["kind"] != "reconstruction":
+        raise HTTPException(400, "Referenced job is not a reconstruction")
+    if scene_row["status"] != "succeeded":
+        raise HTTPException(
+            409,
+            f"Scene job is not succeeded (status={scene_row['status']!r}). "
+            "Wait for reconstruction to complete before inserting.",
+        )
+    if not scene_row.get("splat_key"):
+        raise HTTPException(409, "Scene job has no splat — reconstruction may predate this feature")
+
+    insertion_id = uuid.uuid4()
+    params = {
+        "prompt": body.prompt,
+        "position": body.position,
+        "size_m": body.size_m,
+        "orientation": body.orientation,
+    }
+    await db.insert_insertion_job(pool, insertion_id, scene_jid, params)
+
+    from api.main import insertion_worker
+    await insertion_worker.spawn.aio(str(insertion_id))
+
+    return {"job_id": str(insertion_id), "status": "queued"}
+
+
+@fastapi_app.get("/api/insertions/{job_id}")
+async def get_insertion(job_id: str, request: Request):
+    try:
+        jid = uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(404, "Insertion job not found")
+
+    pool = request.app.state.pool
+    row = await db.get_job(pool, jid)
+    if row is None or row.get("kind") != "insertion":
+        raise HTTPException(404, "Insertion job not found")
+
+    result: dict[str, Any] | None = None
+    if row["status"] == "succeeded" and row["result_key"]:
+        r2_client = request.app.state.r2
+        combined_splat_url = await asyncio.to_thread(r2.presign_get, r2_client, row["result_key"])
+        result = {
+            "combined_splat_url": combined_splat_url,
+            "duration_ms": row["duration_ms"],
+        }
+
+    return {
+        "job_id": str(row["id"]),
+        "parent_id": str(row["parent_id"]) if row.get("parent_id") else None,
         "status": row["status"],
         "created_at": row["created_at"].isoformat(),
         "result": result,
