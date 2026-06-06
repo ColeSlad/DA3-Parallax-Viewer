@@ -96,6 +96,13 @@ Modal prints a URL like `https://coleslad--da3-parallax-web-app-dev.modal.run`.
 modal deploy api/main.py
 ```
 
+### Apply the DB migration (run once after deploying this feature)
+
+```bash
+export DATABASE_URL=postgresql://...
+python scripts/migrate.py
+```
+
 ### API contract
 
 ```
@@ -109,7 +116,8 @@ GET  /api/reconstructions/{job_id}
        "status": "queued" | "running" | "succeeded" | "failed",
        "created_at": "iso8601",
        "result": {
-         "ply_url":     "presigned-r2-url (1hr expiry)",
+         "pointcloud_url": "presigned-r2-url (1hr)",
+         "splat_url":      "presigned-r2-url (1hr)",
          "point_count": int,
          "view_count":  int,
          "duration_ms": int
@@ -117,26 +125,74 @@ GET  /api/reconstructions/{job_id}
        "error": "string" | null
      }
   -> 404 if no such job
+
+POST /api/scenes/{scene_job_id}/insertions
+  JSON: { "prompt": str, "position": [x,y,z], "size_m": float, "orientation": str|null }
+  -> 202 { "job_id": "uuid", "status": "queued" }
+  -> 404 if scene job not found
+  -> 409 if scene job not yet succeeded
+
+GET  /api/insertions/{job_id}
+  -> 200 {
+       "job_id": "uuid",
+       "parent_id": "uuid",
+       "status": "queued" | "running" | "succeeded" | "failed",
+       "created_at": "iso8601",
+       "result": {
+         "combined_splat_url": "presigned-r2-url (1hr)",
+         "duration_ms": int
+       } | null,
+       "error": "string" | null
+     }
+  -> 404 if no such insertion job
 ```
 
-### End-to-end curl test
+### End-to-end curl validation
+
+#### Part A — Reconstruct a scene (point cloud + gsplat)
 
 ```bash
-# 1. Upload images and capture job_id
-JOB=$(curl -sf -X POST https://<your-url>/api/reconstructions \
+BASE=https://<your-url>
+
+# 1. Upload photos
+JOB=$(curl -sf -X POST $BASE/api/reconstructions \
   -F "images=@images/001.jpg" \
   -F "images=@images/002.jpg" \
   -F "images=@images/003.jpg")
 echo $JOB
-JOB_ID=$(echo $JOB | jq -r '.job_id')
+SCENE_ID=$(echo $JOB | jq -r '.job_id')
 
-# 2. Poll until done (takes ~30-90s including GPU cold start)
-curl -sf https://<your-url>/api/reconstructions/$JOB_ID | jq .
+# 2. Poll until succeeded (~5 min DA3 + ~20-30 min gsplat fit; GPU cold start adds ~2 min)
+curl -sf $BASE/api/reconstructions/$SCENE_ID | jq .
 
-# 3. Once status=succeeded, download the .ply
-PLY_URL=$(curl -sf https://<your-url>/api/reconstructions/$JOB_ID | jq -r '.result.ply_url')
-curl -o output/result.ply "$PLY_URL"
+# 3. Download both outputs once succeeded
+SPLAT_URL=$(curl -sf $BASE/api/reconstructions/$SCENE_ID | jq -r '.result.splat_url')
+PC_URL=$(curl -sf $BASE/api/reconstructions/$SCENE_ID | jq -r '.result.pointcloud_url')
 
-# Or run the full test in one shot:
-./scripts/test_e2e.sh https://<your-url> ./images
+mkdir -p output
+curl -o output/scene.ply "$SPLAT_URL"
+curl -o output/pointcloud.ply "$PC_URL"
 ```
+
+#### Part B — Insert a generated asset into the scene
+
+```bash
+# Use a world-space position from the reconstructed scene (e.g. scene centroid visible
+# in a point cloud viewer, or from the DA3 extrinsics).  Example: x=0.1 y=-0.2 z=0.0
+
+# 1. Create insertion job
+INS=$(curl -sf -X POST $BASE/api/scenes/$SCENE_ID/insertions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"a small potted plant","position":[0.1,-0.2,0.0],"size_m":0.3}')
+echo $INS
+INS_ID=$(echo $INS | jq -r '.job_id')
+
+# 2. Poll until succeeded (~10 min TRELLIS A100 + ~10 min refit/placement)
+curl -sf $BASE/api/insertions/$INS_ID | jq .
+
+# 3. Download combined splat once succeeded
+COMBINED_URL=$(curl -sf $BASE/api/insertions/$INS_ID | jq -r '.result.combined_splat_url')
+curl -o output/combined.ply "$COMBINED_URL"
+```
+
+Open `output/scene.ply` and `output/combined.ply` in [SuperSplat](https://supersplat.xyz) or [MeshLab](https://www.meshlab.net/) to verify the asset is present and correctly placed.
