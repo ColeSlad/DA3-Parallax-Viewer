@@ -1,12 +1,12 @@
-import { Suspense, useEffect, useRef, useState, type CSSProperties } from 'react'
+import { Suspense, useEffect, useRef, useState } from 'react'
 import { Canvas, useLoader, useThree, useFrame } from '@react-three/fiber'
 import { GizmoHelper, GizmoViewport, Html, TrackballControls } from '@react-three/drei'
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js'
 import * as THREE from 'three'
-import type { JobResult } from '../api'
+import type { ReconstructionResult } from '../api'
 
 interface Props {
-  result: JobResult
+  result: ReconstructionResult
   onReset: () => void
 }
 
@@ -22,7 +22,7 @@ export function PointCloudViewer({ result, onReset }: Props) {
     <div style={{ position: 'fixed', inset: 0, background: '#0f172a' }}>
       <Canvas camera={{ fov: 60, near: 0.01, far: 1000, up: [-1, 0, 0], position: [0, 0, 5] }}>
         <Suspense fallback={<LoadingOverlay />}>
-          <SceneContent url={result.ply_url} savedCamera={savedCamera} />
+          <SceneContent url={result.pointcloud_url} savedCamera={savedCamera} />
           <GizmoHelper alignment="bottom-right" margin={[80, 80]}>
             <GizmoViewport
               axisColors={['#f87171', '#4ade80', '#60a5fa']}

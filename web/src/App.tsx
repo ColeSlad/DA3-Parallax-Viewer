@@ -1,14 +1,14 @@
 import { useState, useEffect } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { submitImages, isTerminal } from './api'
+import { submitImages, isTerminal, type ReconstructionResult } from './api'
 import { useJob } from './hooks/useJob'
 import { UploadForm } from './components/UploadForm'
 import { StatusPanel } from './components/StatusPanel'
-import { PointCloudViewer } from './components/PointCloudViewer'
+import { SplatViewer } from './components/SplatViewer'
 
 const queryClient = new QueryClient()
 
-type Phase = 'idle' | 'submitting' | 'polling' | 'done' | 'error'
+type Phase = 'idle' | 'submitting' | 'reconstructing' | 'scene_ready' | 'error'
 
 function Inner() {
   const [phase, setPhase] = useState<Phase>('idle')
@@ -16,12 +16,12 @@ function Inner() {
   const [submitError, setSubmitError] = useState<string | null>(null)
   const [uploadProgress, setUploadProgress] = useState<number>(0)
 
-  const { data: job } = useJob(phase === 'polling' || phase === 'done' || phase === 'error' ? jobId : null)
+  const polling = phase === 'reconstructing' || phase === 'scene_ready' || phase === 'error'
+  const { data: job } = useJob(polling ? jobId : null)
 
-  // Advance phase when job reaches a terminal state
   useEffect(() => {
-    if (phase === 'polling' && job && isTerminal(job.status)) {
-      setPhase(job.status === 'succeeded' ? 'done' : 'error')
+    if (phase === 'reconstructing' && job && isTerminal(job.status)) {
+      setPhase(job.status === 'succeeded' ? 'scene_ready' : 'error')
     }
   }, [phase, job])
 
@@ -32,7 +32,7 @@ function Inner() {
     try {
       const { job_id } = await submitImages(files, setUploadProgress)
       setJobId(job_id)
-      setPhase('polling')
+      setPhase('reconstructing')
     } catch (e) {
       setSubmitError(e instanceof Error ? e.message : String(e))
       setPhase('idle')
@@ -46,11 +46,16 @@ function Inner() {
     queryClient.removeQueries({ queryKey: ['job'] })
   }
 
-  if (phase === 'done' && job?.result) {
-    return <PointCloudViewer result={job.result} onReset={reset} />
+  if (phase === 'scene_ready' && job?.result) {
+    return (
+      <SplatViewer
+        result={job.result as ReconstructionResult}
+        onReset={reset}
+      />
+    )
   }
 
-  if (phase === 'polling' || phase === 'error') {
+  if (phase === 'reconstructing' || phase === 'error') {
     const status = job?.status ?? 'queued'
     return (
       <StatusPanel
@@ -63,7 +68,11 @@ function Inner() {
 
   return (
     <>
-      <UploadForm onSubmit={handleSubmit} disabled={phase === 'submitting'} uploadProgress={phase === 'submitting' ? uploadProgress : null} />
+      <UploadForm
+        onSubmit={handleSubmit}
+        disabled={phase === 'submitting'}
+        uploadProgress={phase === 'submitting' ? uploadProgress : null}
+      />
       {submitError && (
         <p style={{
           maxWidth: 560,
