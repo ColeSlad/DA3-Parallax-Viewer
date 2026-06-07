@@ -248,7 +248,7 @@ def insertion_worker(job_id: str) -> None:
         print(f"[insertion_worker:{job_id}] scene loaded: {scene.n:,} gaussians")
 
         # 4. Generate asset Gaussians via TRELLIS (runs on A100 in its own container)
-        generate_asset = modal.Function.lookup("da3-parallax", "generate_asset")
+        generate_asset = modal.Function.from_name("da3-parallax", "generate_asset")
         print(f"[insertion_worker:{job_id}] calling generate_asset prompt={prompt!r}")
         asset_data = generate_asset.remote(prompt=prompt, seed=42)
         print(f"[insertion_worker:{job_id}] asset generated: {asset_data['n_gaussians']:,} gaussians")
