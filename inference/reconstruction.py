@@ -181,6 +181,27 @@ def write_ply(result: ReconstructionResult, path: str | Path) -> None:
             f.write(struct.pack("BBB", rgb[i, 0], rgb[i, 1], rgb[i, 2]))
 
 
+def parse_point_cloud_ply(data: bytes) -> tuple[np.ndarray, np.ndarray]:
+    """Parse a point cloud PLY (x y z red green blue) back into (xyz, rgb)."""
+    import io as _io
+    f = _io.BytesIO(data)
+    n_vertices = 0
+    while True:
+        line = f.readline().decode("ascii").strip()
+        if line.startswith("element vertex"):
+            n_vertices = int(line.split()[-1])
+        if line == "end_header":
+            break
+    dtype = np.dtype([
+        ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+        ("red", "u1"), ("green", "u1"), ("blue", "u1"),
+    ])
+    arr = np.frombuffer(f.read(n_vertices * dtype.itemsize), dtype=dtype)
+    xyz = np.stack([arr["x"], arr["y"], arr["z"]], axis=1).astype(np.float32)
+    rgb = np.stack([arr["red"], arr["green"], arr["blue"]], axis=1)
+    return xyz, rgb
+
+
 def ply_to_bytes(result: ReconstructionResult) -> bytes:
     """Serialize a ReconstructionResult to PLY bytes (for transfer over Modal)."""
     buf = io.BytesIO()

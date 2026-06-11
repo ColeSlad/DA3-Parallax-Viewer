@@ -202,8 +202,8 @@ async def create_insertion(
             f"Scene job is not succeeded (status={scene_row['status']!r}). "
             "Wait for reconstruction to complete before inserting.",
         )
-    if not scene_row.get("splat_key"):
-        raise HTTPException(409, "Scene job has no splat — reconstruction may predate this feature")
+    if not scene_row.get("result_key"):
+        raise HTTPException(409, "Scene job has no point cloud — reconstruction may predate this feature")
 
     insertion_id = uuid.uuid4()
     params = {

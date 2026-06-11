@@ -89,6 +89,7 @@ def fit_gaussians(
     n_iters: int = 2000,
     init_scale: float = 0.02,
     scale_reg: float = 0.0,  # L1 penalty on mean Gaussian scale; prevents scale growth
+    iso_reg: float = 0.0,    # L2 penalty on per-axis scale variance; prevents needle shapes
     scale_cap: Optional[float] = None,  # hard ceiling on Gaussian scale; None → init_scale * 10
     device: str = "cuda",
 ) -> GaussianScene:
@@ -153,6 +154,9 @@ def fit_gaussians(
         loss = torch.abs(renders - gt).mean()
         if scale_reg > 0.0:
             loss = loss + scale_reg * torch.exp(log_scales).mean()
+        if iso_reg > 0.0:
+            # Penalise variance between per-axis log-scales: discourages needles
+            loss = loss + iso_reg * (log_scales - log_scales.mean(dim=-1, keepdim=True)).pow(2).mean()
         loss.backward()
         optimizer.step()
 
@@ -536,6 +540,29 @@ def render_around_asset(
 # ---------------------------------------------------------------------------
 # PLY import/export (3DGS / SuperSplat format)
 # ---------------------------------------------------------------------------
+
+def pointcloud_to_gaussians(
+    xyz: np.ndarray,      # (N, 3) float32
+    rgb: np.ndarray,      # (N, 3) uint8
+    scale: float = 0.007, # gaussian radius in scene units (~voxel_size / 3)
+) -> GaussianScene:
+    """Convert a point cloud to tiny isotropic gaussians.
+
+    Preserves the point cloud's appearance in the gaussian splat viewer so
+    the scene looks identical to the original reconstruction rather than
+    using the poorly-fitting gsplat scene.
+    """
+    N = len(xyz)
+    rgb_f = np.clip(rgb.astype(np.float32) / 255.0, 1e-3, 1 - 1e-3)
+    raw_colors = torch.from_numpy(np.log(rgb_f / (1 - rgb_f)).astype(np.float32))
+    return GaussianScene(
+        means=torch.from_numpy(xyz.astype(np.float32)),
+        quats=torch.cat([torch.ones(N, 1), torch.zeros(N, 3)], dim=1),
+        log_scales=torch.full((N, 3), math.log(scale)),
+        logit_opacities=torch.full((N,), 4.0),  # sigmoid(4) ≈ 0.98
+        raw_colors=raw_colors,
+    )
+
 
 def read_splat_ply(data: bytes) -> GaussianScene:
     """

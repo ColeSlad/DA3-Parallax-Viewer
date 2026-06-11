@@ -3,7 +3,7 @@ Modal wiring for the async job layer.
 
 Imports the existing Modal app from inference/app.py (same App object) and
 registers three functions on it:
-  - worker:            GPU function — DA3 inference + gsplat scene fit
+  - worker:            GPU function — DA3 inference + point cloud (no gsplat)
   - insertion_worker:  GPU function — TRELLIS asset generation + placement + merge
   - web_app:           lightweight ASGI function that serves the FastAPI routes
 
@@ -20,13 +20,15 @@ import modal
 # Import the existing app so all functions join the same Modal app.
 # inference/app.py only imports modal, time, and pathlib at module level —
 # no torch/CUDA — so this is safe in the lightweight API container.
-from inference.app import app, gsplat_image, weights_volume, WEIGHTS_DIR
+from inference.app import app, da3_image, gsplat_image, weights_volume, WEIGHTS_DIR
 
 secrets = [modal.Secret.from_name("da3-parallax-secrets")]
 
-# GPU worker image: gsplat_image has DA3 + gsplat + psycopg2 + boto3;
-# add the api package last (add_local_* must come after all build steps).
-worker_image = gsplat_image.add_local_python_source("api")
+# Reconstruction worker only needs DA3 — no gsplat CUDA extensions.
+reconstruction_image = da3_image.add_local_python_source("api")
+
+# Insertion worker needs gsplat (refit_asset_gaussians) — keep the heavier image.
+insertion_image = gsplat_image.add_local_python_source("api")
 
 # API image: lightweight, no GPU deps.
 api_image = (
@@ -42,22 +44,22 @@ api_image = (
 )
 
 # ---------------------------------------------------------------------------
-# GPU worker — reconstruction: DA3 inference + point cloud + gsplat scene fit
+# GPU worker — reconstruction: DA3 inference + point cloud
 # ---------------------------------------------------------------------------
 
 
 @app.function(
-    image=worker_image,
+    image=reconstruction_image,
     gpu="L4",
     volumes={WEIGHTS_DIR: weights_volume},
     secrets=secrets,
-    timeout=3600,  # gsplat fit adds ~20-30 min on top of ~5 min DA3
+    timeout=600,
 )
 def worker(job_id: str) -> None:
     """
-    Download images from R2, run DA3 inference, fit a gsplat scene, upload
-    both the point cloud PLY and the splat PLY, then update Postgres.
-    Postgres is the single source of truth; nothing is returned to the API.
+    Download images from R2, run DA3 inference, upload point cloud PLY, update Postgres.
+    The gsplat scene fit has been removed — insertion uses point cloud gaussians directly,
+    so there is no need to fit a scene splat on the critical path.
     """
     import json
     import os
@@ -73,7 +75,7 @@ def worker(job_id: str) -> None:
     from api.db import sync_get_job, sync_update_job
     from api.r2 import download_bytes, make_client, upload_bytes
     from inference.reconstruction import build_point_cloud, ply_to_bytes
-    from inference.splat_fit import _infer_world_up, fit_gaussians, write_splat_ply
+    from inference.splat_fit import _infer_world_up
 
     r2_client = make_client()
     t0 = time.perf_counter()
@@ -131,35 +133,14 @@ def worker(job_id: str) -> None:
             r2_client.delete_object(Bucket=os.environ["R2_BUCKET"], Key=key)
         print(f"[worker:{job_id}] deleted {len(input_keys)} input images from R2")
 
-        # --- gsplat scene fit ---
-        scene = fit_gaussians(
-            xyz=result.xyz,
-            rgb=result.rgb,
-            images=images_np,
-            intrinsics=intrinsics,
-            extrinsics=extrinsics,
-            n_iters=2000,
-            init_scale=0.02,
-        )
-        splat_path = Path("/tmp/scene.ply")
-        write_splat_ply(scene, splat_path)
-        splat_data = splat_path.read_bytes()
-        splat_key = f"results/{job_id}_splat.ply"
-        upload_bytes(r2_client, splat_key, splat_data)
-        print(f"[worker:{job_id}] splat uploaded ({scene.n:,} gaussians)")
-
         world_up = _infer_world_up(extrinsics)
-        meta_val = json.dumps({
-            "world_up": world_up.tolist(),
-            "n_scene_gaussians": scene.n,
-        })
+        meta_val = json.dumps({"world_up": world_up.tolist()})
 
         duration_ms = int((time.perf_counter() - t0) * 1000)
         sync_update_job(
             job_id,
             status="succeeded",
             result_key=result_key,
-            splat_key=splat_key,
             point_count=result.voxel_count,
             view_count=len(image_paths),
             duration_ms=duration_ms,
@@ -167,8 +148,7 @@ def worker(job_id: str) -> None:
         )
         print(
             f"[worker:{job_id}] succeeded — "
-            f"{result.voxel_count:,} pts, {scene.n:,} gaussians, "
-            f"{len(image_paths)} views, {duration_ms}ms"
+            f"{result.voxel_count:,} pts, {len(image_paths)} views, {duration_ms}ms"
         )
 
     except Exception:
@@ -183,11 +163,11 @@ def worker(job_id: str) -> None:
 
 
 @app.function(
-    image=worker_image,
+    image=insertion_image,
     gpu="L4",
     volumes={WEIGHTS_DIR: weights_volume},
     secrets=secrets,
-    timeout=3600,  # generate_asset (A100) ~10 min + refit ~10 min
+    timeout=1800,  # TRELLIS ~7 min (parallel with point cloud) + refit 500 iter ~1 min
 )
 def insertion_worker(job_id: str) -> None:
     """
@@ -205,8 +185,9 @@ def insertion_worker(job_id: str) -> None:
 
     from api.db import sync_get_job, sync_update_job
     from api.r2 import download_bytes, make_client, upload_bytes
+    from inference.reconstruction import parse_point_cloud_ply
     from inference.splat_fit import (
-        read_splat_ply,
+        pointcloud_to_gaussians,
         refit_asset_gaussians,
         write_splat_ply,
     )
@@ -234,34 +215,38 @@ def insertion_worker(job_id: str) -> None:
         parent_row = sync_get_job(parent_id)
         if parent_row["status"] != "succeeded":
             raise RuntimeError(f"Parent job {parent_id} is not succeeded")
-        splat_key = parent_row["splat_key"]
-        if not splat_key:
-            raise RuntimeError(f"Parent job {parent_id} has no splat_key")
+        pointcloud_key = parent_row["result_key"]
+        if not pointcloud_key:
+            raise RuntimeError(f"Parent job {parent_id} has no result_key")
         meta = parent_row["meta"]
         if isinstance(meta, str):
             meta = json.loads(meta)
         world_up = np.array(meta["world_up"], dtype=np.float32)
 
-        # 3. Download and deserialize scene splat
-        splat_data = download_bytes(r2_client, splat_key)
-        scene = read_splat_ply(splat_data)
-        print(f"[insertion_worker:{job_id}] scene loaded: {scene.n:,} gaussians")
+        # 3. Kick off TRELLIS generation on A100 immediately (non-blocking),
+        # then do local point-cloud work while it runs on the remote GPU.
+        generate_asset_fn = modal.Function.from_name("da3-parallax", "generate_asset")
+        print(f"[insertion_worker:{job_id}] spawning generate_asset prompt={prompt!r}")
+        asset_call = generate_asset_fn.spawn(prompt=prompt, seed=42)
 
-        # 4. Generate asset Gaussians via TRELLIS (runs on A100 in its own container)
-        generate_asset = modal.Function.from_name("da3-parallax", "generate_asset")
-        print(f"[insertion_worker:{job_id}] calling generate_asset prompt={prompt!r}")
-        asset_data = generate_asset.remote(prompt=prompt, seed=42)
+        pc_data = download_bytes(r2_client, pointcloud_key)
+        pc_xyz, pc_rgb = parse_point_cloud_ply(pc_data)
+        scene = pointcloud_to_gaussians(pc_xyz, pc_rgb)
+        print(f"[insertion_worker:{job_id}] scene loaded: {scene.n:,} point-cloud gaussians")
+
+        # Wait for TRELLIS (may already be done if point-cloud prep took long enough)
+        asset_data = asset_call.get()
         print(f"[insertion_worker:{job_id}] asset generated: {asset_data['n_gaussians']:,} gaussians")
 
-        # 5. Deserialize + refit asset Gaussians against mesh training views
+        # 4. Refit asset gaussians (reduced iterations — TRELLIS output is already high quality)
         asset_gs = dict_to_gaussianscene(asset_data)
         asset_gs = refit_asset_gaussians(
             asset_gs,
             mesh_xyz=asset_data.get("mesh_xyz"),
             mesh_rgb=asset_data.get("mesh_rgb"),
-            n_views=20,
+            n_views=8,
             image_hw=(512, 512),
-            n_iters=2000,
+            n_iters=500,
             init_scale=5e-3,
         )
 
