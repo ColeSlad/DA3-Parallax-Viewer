@@ -2,10 +2,16 @@ const BASE = import.meta.env.VITE_API_URL ?? ''
 
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed'
 
-export interface JobResult {
-  ply_url: string
+export interface ReconstructionResult {
+  pointcloud_url: string
+  splat_url: string | null
   point_count: number
   view_count: number
+  duration_ms: number
+}
+
+export interface InsertionResult {
+  combined_splat_url: string
   duration_ms: number
 }
 
@@ -13,7 +19,7 @@ export interface Job {
   job_id: string
   status: JobStatus
   created_at: string
-  result: JobResult | null
+  result: ReconstructionResult | InsertionResult | null
   error: string | null
 }
 
@@ -48,6 +54,25 @@ export function submitImages(
 export async function fetchJob(jobId: string): Promise<Job> {
   const res = await fetch(`${BASE}/api/reconstructions/${jobId}`)
   if (!res.ok) throw new Error(`Poll failed (${res.status})`)
+  return res.json()
+}
+
+export async function fetchInsertion(jobId: string): Promise<Job> {
+  const res = await fetch(`${BASE}/api/insertions/${jobId}`)
+  if (!res.ok) throw new Error(`Poll failed (${res.status})`)
+  return res.json()
+}
+
+export async function createInsertion(
+  sceneJobId: string,
+  body: { prompt: string; position: [number, number, number]; size_m: number; orientation?: string },
+): Promise<{ job_id: string; status: string }> {
+  const res = await fetch(`${BASE}/api/scenes/${sceneJobId}/insertions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error(`Insertion failed (${res.status}): ${await res.text()}`)
   return res.json()
 }
 

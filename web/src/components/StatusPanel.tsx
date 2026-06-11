@@ -14,11 +14,11 @@ export function StatusPanel({ status, error, onReset }: Props) {
       fontFamily: 'system-ui, sans-serif',
       textAlign: 'center',
     }}>
-      {(status === 'queued' || status === 'running') && (
+      {(status === 'queued' || status === 'running' || status === 'succeeded') && (
         <>
           <Spinner />
           <p style={{ marginTop: 16, color: '#475569', fontSize: 16 }}>
-            {status === 'queued' ? 'Queued — waiting for GPU…' : 'Reconstructing…'}
+            {status === 'queued' ? 'Queued — waiting for GPU…' : 'Processing…'}
           </p>
         </>
       )}

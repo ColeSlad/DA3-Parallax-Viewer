@@ -1,18 +1,36 @@
-import { Suspense, useEffect, useRef, useState, type CSSProperties } from 'react'
+import { Suspense, useEffect, useRef, useState } from 'react'
 import { Canvas, useLoader, useThree, useFrame } from '@react-three/fiber'
 import { GizmoHelper, GizmoViewport, Html, TrackballControls } from '@react-three/drei'
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js'
 import * as THREE from 'three'
-import type { JobResult } from '../api'
+import type { ReconstructionResult } from '../api'
 
 interface Props {
-  result: JobResult
+  result: ReconstructionResult
   onReset: () => void
+  onInsert?: (prompt: string, position: [number, number, number], size_m: number) => void
 }
 
-export function PointCloudViewer({ result, onReset }: Props) {
+export function PointCloudViewer({ result, onReset, onInsert }: Props) {
   const savedCamera = useRef<{ pos: THREE.Vector3; quat: THREE.Quaternion; _apply?: boolean } | null>(null)
   const [showControls, setShowControls] = useState(false)
+  const [showInsert, setShowInsert] = useState(false)
+  const [prompt, setPrompt] = useState('')
+  const [px, setPx] = useState('0')
+  const [py, setPy] = useState('0')
+  const [pz, setPz] = useState('0')
+  const [sizeMStr, setSizeMStr] = useState('0.3')
+
+  function handleInsertSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    if (!onInsert || !prompt.trim()) return
+    onInsert(
+      prompt.trim(),
+      [parseFloat(px) || 0, parseFloat(py) || 0, parseFloat(pz) || 0],
+      parseFloat(sizeMStr) || 0.3,
+    )
+    setShowInsert(false)
+  }
 
   function handleReset() {
     if (savedCamera.current) savedCamera.current._apply = true
@@ -22,7 +40,7 @@ export function PointCloudViewer({ result, onReset }: Props) {
     <div style={{ position: 'fixed', inset: 0, background: '#0f172a' }}>
       <Canvas camera={{ fov: 60, near: 0.01, far: 1000, up: [-1, 0, 0], position: [0, 0, 5] }}>
         <Suspense fallback={<LoadingOverlay />}>
-          <SceneContent url={result.ply_url} savedCamera={savedCamera} />
+          <SceneContent url={result.pointcloud_url} savedCamera={savedCamera} />
           <GizmoHelper alignment="bottom-right" margin={[80, 80]}>
             <GizmoViewport
               axisColors={['#f87171', '#4ade80', '#60a5fa']}
@@ -57,10 +75,71 @@ export function PointCloudViewer({ result, onReset }: Props) {
         gap: 8,
         fontFamily: 'system-ui, sans-serif',
       }}>
+        {onInsert && (
+          <button onClick={() => setShowInsert(v => !v)} style={buttonStyle}>Insert object</button>
+        )}
         <button onClick={() => setShowControls(v => !v)} style={buttonStyle}>Controls</button>
         <button onClick={handleReset} style={buttonStyle}>Reset view</button>
         <button onClick={onReset} style={buttonStyle}>Start over</button>
       </div>
+
+      {/* Insert form */}
+      {showInsert && onInsert && (
+        <form onSubmit={handleInsertSubmit} style={{
+          position: 'absolute',
+          top: 56,
+          right: 16,
+          background: '#1e293b',
+          border: '1px solid #334155',
+          borderRadius: 8,
+          padding: '16px 18px',
+          fontFamily: 'system-ui, sans-serif',
+          fontSize: 13,
+          color: '#cbd5e1',
+          minWidth: 260,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 10,
+        }}>
+          <div style={{ color: '#f1f5f9', fontWeight: 600, marginBottom: 2 }}>Insert 3D object</div>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span style={{ color: '#94a3b8', fontSize: 12 }}>Prompt</span>
+            <input
+              value={prompt}
+              onChange={e => setPrompt(e.target.value)}
+              placeholder="a red fire hydrant"
+              required
+              style={inputStyle}
+            />
+          </label>
+          <div>
+            <div style={{ color: '#94a3b8', fontSize: 12, marginBottom: 4 }}>Position (x, y, z)</div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {(['x', 'y', 'z'] as const).map((axis, i) => (
+                <input
+                  key={axis}
+                  value={[px, py, pz][i]}
+                  onChange={e => [setPx, setPy, setPz][i](e.target.value)}
+                  placeholder={axis}
+                  style={{ ...inputStyle, width: 60 }}
+                />
+              ))}
+            </div>
+          </div>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span style={{ color: '#94a3b8', fontSize: 12 }}>Size (m)</span>
+            <input
+              value={sizeMStr}
+              onChange={e => setSizeMStr(e.target.value)}
+              placeholder="0.3"
+              style={{ ...inputStyle, width: 80 }}
+            />
+          </label>
+          <button type="submit" style={{ ...buttonStyle, background: '#3b82f6', border: '1px solid #2563eb', color: '#fff', marginTop: 4 }}>
+            Generate &amp; insert
+          </button>
+        </form>
+      )}
 
       {/* Controls overlay */}
       {showControls && (
@@ -98,6 +177,17 @@ function Row({ label, value }: { label: string; value: string }) {
       <span style={{ color: '#94a3b8' }}>{value}</span>
     </div>
   )
+}
+
+const inputStyle: React.CSSProperties = {
+  background: '#0f172a',
+  border: '1px solid #334155',
+  borderRadius: 4,
+  color: '#f1f5f9',
+  fontSize: 13,
+  padding: '5px 8px',
+  outline: 'none',
+  width: '100%',
 }
 
 const buttonStyle: React.CSSProperties = {
