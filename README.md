@@ -1,20 +1,32 @@
 # DA3-Parallax
 
-Full-stack 3D reconstruction app built on [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3).
+Upload photos of a scene, reconstruct a 3D point cloud, then insert a generated 3D object into it using a text prompt — all rendered in the browser as a gaussian splat.
 
-## Architecture
-
-- React + Vite + TypeScript frontend, @react-three/fiber point-cloud viewer *(planned)*
-- FastAPI backend as Modal ASGI app (`api/main.py`)
-- DA3 inference as a Modal GPU function (L4, scale-to-zero, same Modal app)
-- Postgres (Neon) for job state: `queued → running → succeeded | failed`
-- Cloudflare R2 for uploaded images and output `.ply` files
+**Pipeline:** photos → [DA3](https://github.com/ByteDance-Seed/Depth-Anything-3) multi-view depth inference → point cloud (~5 min) → text prompt → [TRELLIS](https://github.com/microsoft/TRELLIS) 3D asset generation (A100) → combined gaussian splat rendered in-browser.
 
 ---
 
-## Part 1 — GPU inference validation
+## Architecture
 
-Proves DA3 multi-view inference and back-projection work end-to-end.
+| Layer | What |
+|-------|------|
+| Frontend | React + Vite + TypeScript; React Three Fiber point cloud viewer; WebGL gaussian splat viewer (`@mkkellogg/gaussian-splats-3d`) |
+| API | FastAPI served as a Modal ASGI app; async job queue backed by PostgreSQL (Neon) |
+| Reconstruction worker | DA3-LARGE-1.1 on Modal L4; outputs point cloud PLY uploaded to Cloudflare R2 |
+| Insertion worker | TRELLIS + gsplat on Modal L4/A100; converts point cloud to isotropic gaussians, generates and refits a 3D asset, merges and uploads combined PLY |
+| Storage | Cloudflare R2 for input images and output PLY files; presigned URLs delivered to frontend |
+
+### User flow
+
+1. Upload photos in the browser → reconstruction job queued
+2. DA3 runs on L4 GPU (~5 min); point cloud appears in the interactive viewer
+3. User enters a text prompt, world-space position, and size → insertion job queued
+4. TRELLIS generates a 3D asset on A100 (parallelised with scene prep); combined splat uploaded
+5. Browser switches from point cloud viewer to gaussian splat viewer showing the merged result
+
+---
+
+## Setup
 
 ### Prerequisites
 
@@ -23,47 +35,20 @@ pip install modal
 modal token new
 ```
 
-### Run the validation
-
-```bash
-# Against the bundled DA3 SOH example images:
-modal run inference/app.py::validate
-
-# Against your own photos:
-modal run inference/app.py::validate --image-dir ./images
-
-# Tune quality:
-modal run inference/app.py::validate --image-dir ./images --conf-percentile 40 --voxel-size 0.01
-```
-
-Writes `output/validation.ply`. Open in [MeshLab](https://www.meshlab.net/).
-
-| Parameter | Default | Effect |
-|-----------|---------|--------|
-| `--conf-percentile` | `25` | Keep points above this confidence percentile. Higher = fewer, cleaner. |
-| `--voxel-size` | `0.02` | Voxel grid leaf size (meters). Larger = fewer points. |
-
----
-
-## Part 2 — Async job API
-
-FastAPI service + Postgres job lifecycle + R2 storage. Drive entirely with curl.
-
-### External resources to provision
+### External resources
 
 **Neon (Postgres)**
 1. Create a project at [neon.tech](https://neon.tech)
-2. Copy the connection string from *Connection Details → Pooler*:
-   `postgresql://user:pass@ep-xxx.neon.tech/dbname?sslmode=require`
+2. Copy the pooler connection string from *Connection Details*
 
 **Cloudflare R2**
 1. Create a bucket
-2. *R2 → Manage API Tokens* → create token with **Object Read & Write** on that bucket
+2. *R2 → Manage API Tokens* → token with **Object Read & Write** on that bucket
 3. Note your Account ID, Access Key ID, Secret Access Key
 
 ### Modal secret
 
-Create one secret named **`da3-parallax-secrets`** in your Modal dashboard with these keys:
+Create a secret named **`da3-parallax-secrets`** in your Modal dashboard:
 
 | Key | Value |
 |-----|-------|
@@ -74,36 +59,35 @@ Create one secret named **`da3-parallax-secrets`** in your Modal dashboard with 
 | `R2_BUCKET` | your bucket name |
 | `CORS_ORIGIN` | `http://localhost:5173` (or your frontend URL) |
 
-### Apply the DB migration
+You also need a **`huggingface-token`** secret with `HF_TOKEN` for DA3 model weights.
+
+### Apply DB migrations
 
 ```bash
-export DATABASE_URL=postgresql://...   # same string as above
+export DATABASE_URL=postgresql://...
 pip install psycopg2-binary
 python scripts/migrate.py
 ```
 
-### Serve locally (hot reload)
+### Run locally
 
 ```bash
+# Backend (hot reload)
 modal serve api/main.py
+
+# Frontend
+cd web && npm install && npm run dev
 ```
 
-Modal prints a URL like `https://coleslad--da3-parallax-web-app-dev.modal.run`.
-
-### Deploy to production
+### Deploy
 
 ```bash
 modal deploy api/main.py
 ```
 
-### Apply the DB migration (run once after deploying this feature)
+---
 
-```bash
-export DATABASE_URL=postgresql://...
-python scripts/migrate.py
-```
-
-### API contract
+## API
 
 ```
 POST /api/reconstructions
@@ -112,87 +96,76 @@ POST /api/reconstructions
 
 GET  /api/reconstructions/{job_id}
   -> 200 {
-       "job_id": "uuid",
        "status": "queued" | "running" | "succeeded" | "failed",
-       "created_at": "iso8601",
        "result": {
          "pointcloud_url": "presigned-r2-url (1hr)",
-         "splat_url":      "presigned-r2-url (1hr)",
          "point_count": int,
          "view_count":  int,
          "duration_ms": int
-       } | null,
-       "error": "string" | null
+       } | null
      }
-  -> 404 if no such job
 
 POST /api/scenes/{scene_job_id}/insertions
-  JSON: { "prompt": str, "position": [x,y,z], "size_m": float, "orientation": str|null }
+  JSON: { "prompt": str, "position": [x,y,z], "size_m": float }
   -> 202 { "job_id": "uuid", "status": "queued" }
-  -> 404 if scene job not found
   -> 409 if scene job not yet succeeded
 
 GET  /api/insertions/{job_id}
   -> 200 {
-       "job_id": "uuid",
-       "parent_id": "uuid",
        "status": "queued" | "running" | "succeeded" | "failed",
-       "created_at": "iso8601",
        "result": {
          "combined_splat_url": "presigned-r2-url (1hr)",
          "duration_ms": int
-       } | null,
-       "error": "string" | null
+       } | null
      }
-  -> 404 if no such insertion job
 ```
 
-### End-to-end curl validation
-
-#### Part A — Reconstruct a scene (point cloud + gsplat)
+### curl validation
 
 ```bash
-BASE=https://<your-url>
+BASE=https://<your-modal-url>
 
-# 1. Upload photos
+# 1. Upload photos and start reconstruction (~5 min)
 JOB=$(curl -sf -X POST $BASE/api/reconstructions \
   -F "images=@images/001.jpg" \
-  -F "images=@images/002.jpg" \
-  -F "images=@images/003.jpg")
-echo $JOB
+  -F "images=@images/002.jpg")
 SCENE_ID=$(echo $JOB | jq -r '.job_id')
 
-# 2. Poll until succeeded (~5 min DA3 + ~20-30 min gsplat fit; GPU cold start adds ~2 min)
+# 2. Poll until succeeded
 curl -sf $BASE/api/reconstructions/$SCENE_ID | jq .
 
-# 3. Download both outputs once succeeded
-SPLAT_URL=$(curl -sf $BASE/api/reconstructions/$SCENE_ID | jq -r '.result.splat_url')
-PC_URL=$(curl -sf $BASE/api/reconstructions/$SCENE_ID | jq -r '.result.pointcloud_url')
-
-mkdir -p output
-curl -o output/scene.ply "$SPLAT_URL"
-curl -o output/pointcloud.ply "$PC_URL"
-```
-
-#### Part B — Insert a generated asset into the scene
-
-```bash
-# Use a world-space position from the reconstructed scene (e.g. scene centroid visible
-# in a point cloud viewer, or from the DA3 extrinsics).  Example: x=0.1 y=-0.2 z=0.0
-
-# 1. Create insertion job
+# 3. Insert a generated asset (~10-15 min; position in DA3 world frame)
 INS=$(curl -sf -X POST $BASE/api/scenes/$SCENE_ID/insertions \
   -H "Content-Type: application/json" \
   -d '{"prompt":"a small potted plant","position":[0.1,-0.2,0.0],"size_m":0.3}')
-echo $INS
 INS_ID=$(echo $INS | jq -r '.job_id')
 
-# 2. Poll until succeeded (~10 min TRELLIS A100 + ~10 min refit/placement)
+# 4. Poll and download
 curl -sf $BASE/api/insertions/$INS_ID | jq .
-
-# 3. Download combined splat once succeeded
 COMBINED_URL=$(curl -sf $BASE/api/insertions/$INS_ID | jq -r '.result.combined_splat_url')
 curl -o output/combined.ply "$COMBINED_URL"
 ```
 
-Open `output/scene.ply` and `output/combined.ply` in [SuperSplat](https://supersplat.xyz) or [MeshLab](https://www.meshlab.net/) to verify the asset is present and correctly placed.
+Open `output/combined.ply` in [SuperSplat](https://supersplat.xyz) to inspect.
+
+---
+
+## Offline pipeline (no API)
+
+Run the full pipeline locally against Modal GPU functions, saving PLYs and orbit renders:
+
+```bash
+# Point cloud only
+modal run inference/app.py::validate --image-dir ./images
+
+# TRELLIS insertion into a scene
+modal run --detach inference/app.py::trellis_insert \
+  --prompt "a red fire hydrant" \
+  --image-dir ./images \
+  --asset-x 0.1 --asset-y -0.2 --asset-size 0.4
+
+# Download outputs after a detached run
+modal run inference/app.py::download_outputs
+```
+
+Outputs are written to `output/` and also persisted to a Modal volume (`da3-outputs`) so long-running jobs survive local disconnects.
